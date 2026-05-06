@@ -1,0 +1,38 @@
+[build-system]
+# Manual setuptools + CMake build. This avoids a hard dependency on
+# scikit-build-core (which isn't installed in this conda env). The custom
+# CMakeBuild command in setup.py runs cmake on ../cpp and drops the
+# compiled extension at lina_cpp/_core.so.
+requires = ["setuptools>=61", "wheel", "pybind11>=2.10", "cmake>=3.16"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lina_cpp"
+version = "0.1.0"
+description = "C++-backed mirror of the lina wavefront sensing & control package"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Adam Schilperoort" }]
+# Runtime dependency on `lina` itself: the C++ port covers the math hot
+# paths (utils, props, dm, efc, iefc, aefc, ...). Hardware control,
+# plotting, telemetry, llowfsc loop orchestration, etc. are re-exported
+# from `lina` until they are also ported. See lina_cpp/__init__.py.
+dependencies = [
+    "numpy>=1.20",
+    "scipy",
+    "astropy",
+    "lina",
+]
+
+# src/ layout: keeps the outer lina_cpp/ directory from being picked up
+# as an empty namespace package when tests run from the repo root.
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["lina_cpp*"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+# Tell setuptools that compiled .so files belong to the package.
+[tool.setuptools.package-data]
+"lina_cpp" = ["*.so"]

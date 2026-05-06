@@ -4,5 +4,15 @@ build/*
 dist/*
 
 lina.egg-info
+*.egg-info
 
 misc/
+
+# C++ extension outputs (never commit -- everyone builds these locally)
+*.cpython-*.so
+*.so
+
+# Conda / virtualenv local installs
+.venv/
+.env/
+

@@ -1,0 +1,40 @@
+# Build artifacts -- never commit. Out-of-source builds are preferred:
+#   cmake -S cpp -B cpp/build -DLINA_BUILD_PYBIND=ON ...
+#   cmake -S cpp -B cpp/build-cuda -DLINA_USE_CUDA=ON ...
+build/
+build-*/
+install/
+
+# In-source CMake artifacts (these are what end up here when CMake is
+# accidentally run with `cmake .` inside cpp/).
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.cmake
+!cmake/*.cmake          # keep packaging cmake/ helpers
+*.dir/
+compile_commands.json
+
+# Compiled outputs
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.exp
+
+# pybind / Python extension outputs
+*.cpython-*.so
+__pycache__/
+
+# IDE / editor scratch
+.vscode/
+.idea/
+*.swp
+.cache/
