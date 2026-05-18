@@ -93,6 +93,30 @@ for _name in dir(_ext):
 
 
 # ---------------------------------------------------------------------------
+# 2b. CPU/GPU device dispatch helpers.
+#
+#    Exposed at the package top level so users can do:
+#        lina_cpp.set_device("gpu")    # all subsequent calls go to GPU
+#        lina_cpp.gpu_available()      # True if CUDA was compiled in
+#        lina_cpp.get_device()         # current default
+#
+#    Each math wrapper in lina_cpp.props, lina_cpp.utils, etc. also
+#    accepts a per-call ``device=`` kwarg that overrides the default
+#    for one call.
+# ---------------------------------------------------------------------------
+
+from ._dispatch import (  # noqa: E402
+    get_device,
+    gpu_available,
+    set_device,
+)
+
+_dispatch_names = ("get_device", "gpu_available", "set_device")
+for _name in _dispatch_names:
+    _flat_names.append(_name)
+
+
+# ---------------------------------------------------------------------------
 # 3. Submodule layout: thin Python wrappers that mirror lina's modules.
 #    These re-export from lina.* for un-ported helpers and delegate
 #    math hot paths to lina_cpp._core. The submodules require `lina` to

@@ -10,6 +10,11 @@ import stat
 import time
 import threading
 
+# Optional hardware-control packages: only available on MagAOX-class
+# instrument hosts. Missing them is the common case (notebooks, CI,
+# non-instrument workstations) -- the rest of lina.rt_utils still works
+# for analysis. We emit an ImportWarning instead of a bare print() so
+# users can silence it with `warnings.simplefilter("ignore", ImportWarning)`.
 try:
     import magpyx
     from magpyx.utils import ImageStream
@@ -18,8 +23,15 @@ try:
     from purepyindi import INDIClient
     import purepyindi2
     from purepyindi2 import IndiClient
-except:
-    print('Could not import all packages associated with XWC toolkit.')
+except Exception as _xwc_err:  # noqa: BLE001
+    import warnings as _warnings
+    _warnings.warn(
+        f"lina.rt_utils: XWC toolkit packages unavailable "
+        f"({type(_xwc_err).__name__}: {_xwc_err!s}); hardware-stream "
+        "helpers will not be usable. Analysis paths still work.",
+        ImportWarning,
+        stacklevel=2,
+    )
 
 def create_shmim(shmim_name, shape, dtype=np.float32):
     img = shmio.Image()

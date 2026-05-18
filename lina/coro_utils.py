@@ -13,12 +13,24 @@ import skimage
 from matplotlib.patches import Circle
 from matplotlib.colors import LogNorm
 
+# Optional SCoOB instrument-control packages: only present on the
+# SCoOB testbed host. Missing them is normal for off-instrument
+# analysis. Emit an ImportWarning so it can be silenced with the
+# standard `warnings.simplefilter("ignore", ImportWarning)` like the
+# other optional-dependency notices in lina.
 try:
     # from scoobpy import utils as scoob_utils
     import purepyindi
     import purepyindi2
-except ImportError:
-    print('SCoOB interface does not have the required packages to operate.')
+except ImportError as _scoob_err:
+    import warnings as _warnings
+    _warnings.warn(
+        f"lina.coro_utils: SCoOB interface packages unavailable "
+        f"({type(_scoob_err).__name__}: {_scoob_err!s}); hardware-control "
+        "functions will not be usable. Analysis paths still work.",
+        ImportWarning,
+        stacklevel=2,
+    )
 
 def normalize_coro_im(raw_im, im_params, ref_params, dark_im=0.0, verbose=True):
     # exp_time_factor = ref_params['exp_time'] / im_params['exp_time'] if 'exp_time' in ref_params.keys() else 1.0
