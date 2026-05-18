@@ -117,31 +117,39 @@ _submodules = (
     "aefc",
 )
 
-try:
-    from importlib import import_module as _import_module
+from importlib import import_module as _import_module
+import sys as _sys
+import warnings as _warnings
 
-    for _sub in _submodules:
+_pkg = _sys.modules[__name__]
+_failed_submodules: dict[str, BaseException] = {}
+
+# Try each submodule individually so a single bad one (e.g. a busted
+# cupy install when loading the rt_utils / math_module wrappers)
+# doesn't take down the rest. The flat top-level C++ symbols are
+# already in place by the point we get here, so even total submodule
+# failure leaves the package usable for the parity-test surface.
+for _sub in _submodules:
+    try:
         _import_module(f"{__name__}.{_sub}")
-    # Now bind them as attributes on the package so `lina_cpp.utils`
-    # works even if the user hasn't done `import lina_cpp.utils`.
-    import sys as _sys
-
-    _pkg = _sys.modules[__name__]
-    for _sub in _submodules:
         setattr(_pkg, _sub, _sys.modules[f"{__name__}.{_sub}"])
-except ImportError as _err:
-    # The lina Python package isn't installed, or one of the submodule
-    # wrappers raised. Keep the flat top-level symbols working but
-    # report what went wrong so the user can fix it instead of being
-    # surprised by `AttributeError: module 'lina_cpp' has no attribute
-    # 'utils'`.
-    import warnings as _warnings
+    except BaseException as _err:  # noqa: BLE001
+        # We catch BaseException (not just ImportError / Exception) because
+        # cupy in particular can raise AttributeError, RuntimeError, or
+        # SystemExit from inside its CUDA discovery code on broken envs.
+        _failed_submodules[_sub] = _err
 
+if _failed_submodules:
+    _names = ", ".join(sorted(_failed_submodules))
+    _details = "; ".join(
+        f"{name}: {type(err).__name__}: {err}"
+        for name, err in _failed_submodules.items()
+    )
     _warnings.warn(
-        f"lina_cpp: submodule wrappers ({', '.join(_submodules)}) could "
-        f"not be loaded ({_err!s}). Flat top-level C++ symbols still "
-        "work; install the `lina` package to enable the submodule "
-        "wrappers.",
+        f"lina_cpp: the following submodule wrappers failed to load and "
+        f"are unavailable as attributes of the package: {_names}. "
+        f"Flat top-level C++ symbols (e.g. lina_cpp.fft_cpu) still work. "
+        f"Details: {_details}",
         ImportWarning,
         stacklevel=2,
     )

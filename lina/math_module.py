@@ -1,12 +1,27 @@
 import numpy as np
 import scipy
 
+# cupy is optional. We treat *any* failure during cupy import as "cupy
+# is unavailable, fall back to numpy" -- not just plain ImportError.
+# In practice cupy raises AttributeError, RuntimeError, OSError or
+# similar when its CUDA discovery breaks (e.g. CUDA toolkit missing on
+# the host even though the cupy wheel is installed). We don't want
+# any of those to kill the whole `import lina` chain.
 try:
     import cupy
     import cupyx.scipy
     cupy_avail = True
-except ImportError:
+except Exception as _cupy_err:  # noqa: BLE001
     cupy_avail = False
+    cupy = None  # type: ignore[assignment]
+    cupyx = None  # type: ignore[assignment]
+    import warnings as _warnings
+    _warnings.warn(
+        f"cupy import failed ({type(_cupy_err).__name__}: {_cupy_err!s}); "
+        "falling back to numpy backend. GPU paths will be unavailable.",
+        ImportWarning,
+        stacklevel=2,
+    )
 
 class np_backend:
     """A shim that allows a backend to be swapped at runtime."""
