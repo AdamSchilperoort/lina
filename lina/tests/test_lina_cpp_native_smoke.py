@@ -23,5 +23,7 @@ def test_gemm_identity():
 
 def test_pad_or_crop_shape():
     x = np.ones((3, 3), dtype=np.float64)
-    y = lina.pad_or_crop(x, 5, 5)
+    # pad_or_crop takes (array, npix) -- pads/crops to a square npix x npix output,
+    # matching lina.utils.pad_or_crop.
+    y = lina.pad_or_crop(x, 5)
     assert y.shape == (5, 5)
