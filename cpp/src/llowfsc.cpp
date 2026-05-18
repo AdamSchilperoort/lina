@@ -133,6 +133,55 @@ AcquireRefResult acquire_ref(const Array2D<double>& camlo_ref_im,
 // reconstruct kernel
 // ---------------------------------------------------------------------------
 
+// Row-dot helper. Deliberately compiled as an opaque, non-inlined
+// function so the auto-vectorizer cannot fuse this inner loop with the
+// outer one in reconstruct(). On NVIDIA Jetson (aarch64) gcc with
+// CUDA-enabled -O3, the vectorizer was collapsing the per-row pointer
+// stride and producing `coeff[k] == coeff[0]` for all k. With
+// __attribute__((noinline)) the compiler must emit a real call site
+// per outer iteration, with `row_start` as a runtime parameter, which
+// it cannot hoist. The `__attribute__((optimize("no-tree-vectorize")))`
+// belt-and-suspenders disables the tree vectorizer inside the helper
+// itself for the same reason.
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline, optimize("no-tree-vectorize")))
+#elif defined(__clang__)
+__attribute__((noinline, optnone))
+#else
+[[gnu::noinline]]
+#endif
+static double safe_dot_row(const double* mat,
+                           std::size_t row_start,
+                           std::size_t cols,
+                           const double* vec) noexcept {
+    double s = 0.0;
+    for (std::size_t j = 0; j < cols; ++j) {
+        s += mat[row_start + j] * vec[j];
+    }
+    return s;
+}
+
+// Same noinline guarantee as safe_dot_row, but for the scaled-add
+// pattern dst[k] += w * mat[row_start + k] used by loop_step's
+// modal-command sum.
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline, optimize("no-tree-vectorize")))
+#elif defined(__clang__)
+__attribute__((noinline, optnone))
+#else
+[[gnu::noinline]]
+#endif
+static void safe_axpy_row(double* dst,
+                          const double* mat,
+                          std::size_t row_start,
+                          std::size_t cols,
+                          double w) noexcept {
+    for (std::size_t k = 0; k < cols; ++k) {
+        dst[k] += w * mat[row_start + k];
+    }
+}
+
+
 std::vector<double> reconstruct(const Array2D<double>& camlo_im,
                                 const Array2D<double>& ref_im,
                                 const Array2D<std::uint8_t>& wfs_mask,
@@ -200,25 +249,16 @@ std::vector<double> reconstruct(const Array2D<double>& camlo_im,
     std::vector<double> coeff(mode_hi - mode_lo, 0.0);
 
     // The control matrix is row-major (Nmodes, Nmask). We compute
-    //     coeff[k] = sum_j  control_matrix(mode_lo+k, j) * del_masked[j]
-    // using the safe 2-D accessor instead of raw pointer arithmetic.
-    //
-    // Earlier we hand-rolled this as
-    //     const double* row = C + (mode_lo + k) * Ncol;
-    //     for (j ...) s += row[j] * del_masked[j];
-    // which on some toolchains (observed: gcc 12 in a CUDA-enabled
-    // build with -O3) miscompiles the per-row pointer increment and
-    // collapses every coeff[k] to coeff[0]. The 2-D accessor below
-    // forces the index multiply per element and is immune.
+    //     coeff[k] = sum_j  C[(mode_lo+k) * Ncol + j] * del_masked[j]
+    // via the opaque noinline helper safe_dot_row(). See the comment
+    // above safe_dot_row() for why we don't just inline this.
     const std::size_t Ncol = control_matrix.cols();
     const std::size_t k_count = mode_hi - mode_lo;
+    const double* C = control_matrix.data();
+    const double* vec = del_masked.data();
     for (std::size_t k = 0; k < k_count; ++k) {
-        const std::size_t k_row = mode_lo + k;
-        double s = 0.0;
-        for (std::size_t j = 0; j < Ncol; ++j) {
-            s += control_matrix(k_row, j) * del_masked[j];
-        }
-        coeff[k] = s;
+        const std::size_t row_start = (mode_lo + k) * Ncol;
+        coeff[k] = safe_dot_row(C, row_start, Ncol, vec);
     }
     return coeff;
 }
@@ -257,23 +297,23 @@ Array2D<double> compute_zpo(const std::vector<std::vector<double>>& dm_commands_
         }
 
         // tmp_modes = dm_modal_matrix . dm_cmd   (Nmodes x Ndm) * (Ndm) -> (Nmodes)
-        // Use the 2-D accessor to dodge a row-pointer hoisting bug seen
-        // in some gcc + CUDA-enabled -O3 builds (see reconstruct()).
-        for (std::size_t i = 0; i < Nmodes; ++i) {
-            double s = 0.0;
-            for (std::size_t j = 0; j < Ndm; ++j) {
-                s += dm_modal_matrix(i, j) * dm_cmd[j];
+        // safe_dot_row() is __noinline__'d to dodge the aarch64+CUDA+O3
+        // row-stride hoisting bug -- see reconstruct().
+        {
+            const double* M = dm_modal_matrix.data();
+            const double* x = dm_cmd.data();
+            for (std::size_t i = 0; i < Nmodes; ++i) {
+                tmp_modes[i] = safe_dot_row(M, i * Ndm, Ndm, x);
             }
-            tmp_modes[i] = s;
         }
 
         // tmp_pixels = response_matrix . tmp_modes  (Nmask x Nmodes) * (Nmodes) -> (Nmask)
-        for (std::size_t i = 0; i < Nmask; ++i) {
-            double s = 0.0;
-            for (std::size_t j = 0; j < Nmodes; ++j) {
-                s += response_matrix(i, j) * tmp_modes[j];
+        {
+            const double* R = response_matrix.data();
+            const double* x = tmp_modes.data();
+            for (std::size_t i = 0; i < Nmask; ++i) {
+                tmp_pixels[i] = safe_dot_row(R, i * Nmodes, Nmodes, x);
             }
-            tmp_pixels[i] = s;
         }
 
         // zpo_masked += tmp_pixels
@@ -335,17 +375,17 @@ Array2D<double> loop_step(const Array2D<double>& camlo_im,
     }
 
     // 4) del_dm_command = sum_i modal_coeff[i] * dm_modes_flat[mode_lo+i, :]
-    // 2-D accessor for the same reason as reconstruct() / compute_zpo().
+    // We delegate the per-row scaled-add to a noinline helper for the
+    // same reason as reconstruct() (see safe_dot_row()).
     Array2D<double> del_dm(dm_rows, dm_cols, 0.0);
     const std::size_t Ndm = dm_rows * dm_cols;
     double* dst = del_dm.data();
+    const double* M = dm_modes_flat.data();
     for (std::size_t i = 0; i < modal_coeff.size(); ++i) {
         const double w = modal_coeff[i];
         if (w == 0.0) continue;
-        const std::size_t mrow = mode_lo + i;
-        for (std::size_t k = 0; k < Ndm; ++k) {
-            dst[k] += w * dm_modes_flat(mrow, k);
-        }
+        const std::size_t row_start = (mode_lo + i) * Ndm;
+        safe_axpy_row(dst, M, row_start, Ndm, w);
     }
     return del_dm;
 }

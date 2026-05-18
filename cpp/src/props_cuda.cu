@@ -1,5 +1,7 @@
 #include "lina/props.h"
 
+#include <complex>
+#include <cstddef>
 #include <stdexcept>
 
 #ifdef LINA_USE_CUDA
@@ -10,8 +12,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
-#include <complex>
-#include <cstddef>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -56,36 +57,80 @@ Array2D<std::complex<double>> ifftshift_local(const Array2D<std::complex<double>
     return shift2d(in, (in.rows() + 1) / 2, (in.cols() + 1) / 2);
 }
 
+// ---------------------------------------------------------------------------
+// GPU shift kernels (replace host-side fftshift / ifftshift).
+//
+// shift2d_kernel reads from `in[r, c]` and writes to `out[(r+shift_r)%rows,
+// (c+shift_c)%cols]`. This is the same convention as the host-side
+// shift2d above, with two specialisations:
+//   * fftshift  : shift_r = rows/2,        shift_c = cols/2         (floor)
+//   * ifftshift : shift_r = (rows+1)/2,    shift_c = (cols+1)/2     (ceil)
+// For even sizes these coincide; for odd sizes they differ by one row /
+// column, matching numpy / cupy.
+//
+// The `_scaled` variant multiplies by a real scalar in the same pass,
+// which lets the inverse-FFT normalisation (1/N) happen "for free"
+// while we are already touching every output element.
+// ---------------------------------------------------------------------------
+
+__global__ void shift2d_kernel(const cufftDoubleComplex* __restrict__ in,
+                               cufftDoubleComplex*       __restrict__ out,
+                               std::size_t rows, std::size_t cols,
+                               std::size_t shift_r, std::size_t shift_c) {
+    const std::size_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::size_t r = blockIdx.y * blockDim.y + threadIdx.y;
+    if (r >= rows || c >= cols) return;
+    const std::size_t rr = (r + shift_r) % rows;
+    const std::size_t cc = (c + shift_c) % cols;
+    out[rr * cols + cc] = in[r * cols + c];
+}
+
+__global__ void shift2d_scaled_kernel(const cufftDoubleComplex* __restrict__ in,
+                                      cufftDoubleComplex*       __restrict__ out,
+                                      std::size_t rows, std::size_t cols,
+                                      std::size_t shift_r, std::size_t shift_c,
+                                      double scale) {
+    const std::size_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::size_t r = blockIdx.y * blockDim.y + threadIdx.y;
+    if (r >= rows || c >= cols) return;
+    const std::size_t rr = (r + shift_r) % rows;
+    const std::size_t cc = (c + shift_c) % cols;
+    const cufftDoubleComplex v = in[r * cols + c];
+    out[rr * cols + cc] = make_cuDoubleComplex(v.x * scale, v.y * scale);
+}
+
 struct CufftPlanKey {
     std::size_t rows;
     std::size_t cols;
-    bool inverse;
 
     bool operator==(const CufftPlanKey& other) const {
-        return rows == other.rows && cols == other.cols && inverse == other.inverse;
+        return rows == other.rows && cols == other.cols;
     }
 };
 
 struct CufftPlanKeyHash {
     std::size_t operator()(const CufftPlanKey& key) const noexcept {
         return std::hash<std::size_t>()(key.rows) ^
-               (std::hash<std::size_t>()(key.cols) << 1) ^
-               (std::hash<bool>()(key.inverse) << 2);
+               (std::hash<std::size_t>()(key.cols) << 1);
     }
 };
 
+// A single cuFFT plan handles both forward and inverse (direction is
+// passed to cufftExecZ2Z). So we cache one plan per (rows, cols).
 class CufftPlanCache {
 public:
-    cufftHandle get_plan(std::size_t rows, std::size_t cols, bool inverse) {
+    cufftHandle get_plan(std::size_t rows, std::size_t cols) {
         std::lock_guard<std::mutex> lock(mutex_);
-        const CufftPlanKey key{rows, cols, inverse};
+        const CufftPlanKey key{rows, cols};
         const auto it = plans_.find(key);
         if (it != plans_.end()) {
             return it->second;
         }
-
         cufftHandle plan;
-        check_cufft(cufftPlan2d(&plan, static_cast<int>(rows), static_cast<int>(cols), CUFFT_Z2Z),
+        check_cufft(cufftPlan2d(&plan,
+                                static_cast<int>(rows),
+                                static_cast<int>(cols),
+                                CUFFT_Z2Z),
                     "cufftPlan2d failed");
         plans_.emplace(key, plan);
         return plan;
@@ -107,43 +152,138 @@ CufftPlanCache& cufft_cache() {
     return cache;
 }
 
-Array2D<std::complex<double>> fft_cufft(const Array2D<std::complex<double>>& arr, bool inverse) {
-    const std::size_t rows = arr.rows();
-    const std::size_t cols = arr.cols();
-    const auto shifted = inverse ? ifftshift_local(arr) : fftshift_local(arr);
+// ---------------------------------------------------------------------------
+// Device scratch pool.
+//
+// Each (rows, cols) FFT call needs two device-side complex buffers (one
+// for the staged input + shifted-output, one for the FFT in/out). We
+// keep them per-size in a small LRU cache so that a steady-state loop
+// never calls cudaMalloc / cudaFree.
+// ---------------------------------------------------------------------------
 
-    Array2D<std::complex<double>> out(rows, cols, {0.0, 0.0});
+struct DeviceScratch {
+    cufftDoubleComplex* buf_a = nullptr;
+    cufftDoubleComplex* buf_b = nullptr;
+    std::size_t count = 0;
 
-    const std::size_t count = rows * cols;
-    cufftDoubleComplex* d_data = nullptr;
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_data), sizeof(cufftDoubleComplex) * count),
-               "cudaMalloc cufft data failed");
+    DeviceScratch(std::size_t n) : count(n) {
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&buf_a),
+                              sizeof(cufftDoubleComplex) * n),
+                   "cudaMalloc fft scratch A failed");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&buf_b),
+                              sizeof(cufftDoubleComplex) * n),
+                   "cudaMalloc fft scratch B failed");
+    }
+    ~DeviceScratch() {
+        if (buf_a) cudaFree(buf_a);
+        if (buf_b) cudaFree(buf_b);
+    }
+    DeviceScratch(const DeviceScratch&) = delete;
+    DeviceScratch& operator=(const DeviceScratch&) = delete;
+};
 
-    check_cuda(cudaMemcpy(d_data, shifted.data(),
-                          sizeof(cufftDoubleComplex) * count,
-                          cudaMemcpyHostToDevice),
-               "cudaMemcpy cufft input failed");
-
-    const int direction = inverse ? CUFFT_INVERSE : CUFFT_FORWARD;
-    cufftHandle plan = cufft_cache().get_plan(rows, cols, inverse);
-    check_cufft(cufftExecZ2Z(plan, d_data, d_data, direction), "cufftExecZ2Z failed");
-
-    check_cuda(cudaMemcpy(out.data(), d_data,
-                          sizeof(cufftDoubleComplex) * count,
-                          cudaMemcpyDeviceToHost),
-               "cudaMemcpy cufft output failed");
-
-    if (inverse) {
-        const double norm = 1.0 / static_cast<double>(rows * cols);
-        for (std::size_t i = 0; i < out.size(); ++i) {
-            out.data()[i] *= norm;
-        }
-        out = fftshift_local(out);
-    } else {
-        out = ifftshift_local(out);
+class ScratchCache {
+public:
+    std::shared_ptr<DeviceScratch> get(std::size_t rows, std::size_t cols) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const CufftPlanKey key{rows, cols};
+        auto it = pool_.find(key);
+        if (it != pool_.end()) return it->second;
+        if (pool_.size() >= kCap) pool_.erase(pool_.begin());
+        auto s = std::make_shared<DeviceScratch>(rows * cols);
+        pool_.emplace(key, s);
+        return s;
     }
 
-    cudaFree(d_data);
+private:
+    static constexpr std::size_t kCap = 16;
+    std::unordered_map<CufftPlanKey,
+                       std::shared_ptr<DeviceScratch>,
+                       CufftPlanKeyHash> pool_;
+    std::mutex mutex_;
+};
+
+ScratchCache& scratch_cache() {
+    static ScratchCache c;
+    return c;
+}
+
+// Dedicated CUDA stream for FFTs so multiple library entry points can
+// pipeline H2D / kernels / D2H without serialising on the default
+// stream against unrelated work.
+cudaStream_t fft_stream() {
+    static cudaStream_t s = []() {
+        cudaStream_t tmp;
+        check_cuda(cudaStreamCreate(&tmp), "cudaStreamCreate failed");
+        return tmp;
+    }();
+    return s;
+}
+
+Array2D<std::complex<double>> fft_cufft(const Array2D<std::complex<double>>& arr,
+                                        bool inverse) {
+    const std::size_t rows  = arr.rows();
+    const std::size_t cols  = arr.cols();
+    const std::size_t count = rows * cols;
+
+    auto scratch     = scratch_cache().get(rows, cols);
+    cufftHandle plan = cufft_cache().get_plan(rows, cols);
+    cudaStream_t stm = fft_stream();
+    check_cufft(cufftSetStream(plan, stm), "cufftSetStream failed");
+
+    // Pre-shift parameters (numpy convention used by lina):
+    //   forward : input is fftshifted before fft2, ifftshifted after.
+    //   inverse : input is ifftshifted before ifft2, fftshifted after.
+    const std::size_t pre_r  = inverse ? (rows + 1) / 2 : rows / 2;
+    const std::size_t pre_c  = inverse ? (cols + 1) / 2 : cols / 2;
+    const std::size_t post_r = inverse ? rows / 2 : (rows + 1) / 2;
+    const std::size_t post_c = inverse ? cols / 2 : (cols + 1) / 2;
+
+    // 1) Async H2D into buf_a.
+    check_cuda(cudaMemcpyAsync(scratch->buf_a, arr.data(),
+                               sizeof(cufftDoubleComplex) * count,
+                               cudaMemcpyHostToDevice, stm),
+               "cudaMemcpyAsync H2D failed");
+
+    // 2) Pre-shift on GPU: buf_a -> buf_b.
+    {
+        const dim3 block(16, 16);
+        const dim3 grid((cols + block.x - 1) / block.x,
+                        (rows + block.y - 1) / block.y);
+        shift2d_kernel<<<grid, block, 0, stm>>>(scratch->buf_a, scratch->buf_b,
+                                                rows, cols, pre_r, pre_c);
+    }
+
+    // 3) cuFFT in-place on buf_b.
+    const int direction = inverse ? CUFFT_INVERSE : CUFFT_FORWARD;
+    check_cufft(cufftExecZ2Z(plan, scratch->buf_b, scratch->buf_b, direction),
+                "cufftExecZ2Z failed");
+
+    // 4) Post-shift (and inverse scale, fused) on GPU: buf_b -> buf_a.
+    {
+        const dim3 block(16, 16);
+        const dim3 grid((cols + block.x - 1) / block.x,
+                        (rows + block.y - 1) / block.y);
+        if (inverse) {
+            const double norm = 1.0 / static_cast<double>(count);
+            shift2d_scaled_kernel<<<grid, block, 0, stm>>>(
+                scratch->buf_b, scratch->buf_a, rows, cols, post_r, post_c, norm);
+        } else {
+            shift2d_kernel<<<grid, block, 0, stm>>>(
+                scratch->buf_b, scratch->buf_a, rows, cols, post_r, post_c);
+        }
+    }
+
+    // 5) Async D2H into the output buffer.
+    Array2D<std::complex<double>> out(rows, cols, {0.0, 0.0});
+    check_cuda(cudaMemcpyAsync(out.data(), scratch->buf_a,
+                               sizeof(cufftDoubleComplex) * count,
+                               cudaMemcpyDeviceToHost, stm),
+               "cudaMemcpyAsync D2H failed");
+
+    // 6) Synchronise -- caller observes a fully-materialised host array.
+    check_cuda(cudaStreamSynchronize(stm), "cudaStreamSynchronize failed");
+
     return out;
 }
 
@@ -209,6 +349,23 @@ __global__ void cmul_kernel(cuDoubleComplex* a,
     const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     a[i] = cuCmul(a[i], b[i]);
+}
+
+// MFT matrix builder on device:
+//   M[a, b] = exp(j * sign * 2pi * U[a] * X[b])
+// `U` is a device buffer of length `rows`; `X` is a device buffer of
+// length `cols`. The grid maps (a, b) -> (blockIdx.y * blockDim.y +
+// threadIdx.y, blockIdx.x * blockDim.x + threadIdx.x).
+__global__ void mft_matrix_kernel(cuDoubleComplex* __restrict__ M,
+                                  const double*    __restrict__ U,
+                                  const double*    __restrict__ X,
+                                  std::size_t rows, std::size_t cols,
+                                  double sign_two_pi /* = sign * 2*pi */) {
+    const std::size_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    const std::size_t a = blockIdx.y * blockDim.y + threadIdx.y;
+    if (a >= rows || b >= cols) return;
+    const double phase = sign_two_pi * U[a] * X[b];
+    M[a * cols + b] = make_cuDoubleComplex(cos(phase), sin(phase));
 }
 
 // Build the angular-spectrum transfer function in-place on the device:
@@ -285,6 +442,183 @@ build_mft_matrix(const std::vector<double>& U,
         }
     }
     return M;
+}
+
+// ---------------------------------------------------------------------------
+// Device-side MFT matrix cache.
+//
+// The CPU MFT learned the same trick: in a wavefront-control loop the
+// geometry (npix, npsf, du, sign, centering) is invariant, so we should
+// build Mx / My exactly once per geometry. On the GPU we additionally
+// avoid the host build + H2D entirely by building the matrices on the
+// device using a small kernel. A single shared_ptr<DeviceMftMatrix>
+// holds the device pointer + size so eviction is reference-counted and
+// the matrix cannot be freed while any caller is mid-gemm.
+// ---------------------------------------------------------------------------
+
+struct DeviceMftMatrix {
+    cuDoubleComplex* d_M = nullptr;
+    std::size_t rows = 0;
+    std::size_t cols = 0;
+
+    DeviceMftMatrix(std::size_t r, std::size_t c) : rows(r), cols(c) {
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_M),
+                              sizeof(cuDoubleComplex) * r * c),
+                   "cudaMalloc mft matrix failed");
+    }
+    ~DeviceMftMatrix() { if (d_M) cudaFree(d_M); }
+    DeviceMftMatrix(const DeviceMftMatrix&) = delete;
+    DeviceMftMatrix& operator=(const DeviceMftMatrix&) = delete;
+};
+
+struct MftDevKey {
+    std::size_t rows;
+    std::size_t cols;
+    double sign_two_pi;
+    // Hash of the U and X coordinate vectors (which fully determine the
+    // matrix). We hash bit-for-bit so values that compare equal as
+    // doubles hash equal; the coordinate vectors are deterministic
+    // functions of (n, pixelscale, centering), so this matches the
+    // intent of "same geometry -> same matrix".
+    std::size_t u_hash;
+    std::size_t x_hash;
+    bool operator==(const MftDevKey& o) const noexcept {
+        return rows == o.rows && cols == o.cols
+            && sign_two_pi == o.sign_two_pi
+            && u_hash == o.u_hash && x_hash == o.x_hash;
+    }
+};
+
+struct MftDevKeyHash {
+    std::size_t operator()(const MftDevKey& k) const noexcept {
+        std::size_t h = std::hash<std::size_t>{}(k.rows);
+        h ^= std::hash<std::size_t>{}(k.cols)  + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+        h ^= std::hash<double>{}(k.sign_two_pi)+ 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+        h ^= k.u_hash                          + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+        h ^= k.x_hash                          + 0x9e3779b97f4a7c15ULL + (h<<6) + (h>>2);
+        return h;
+    }
+};
+
+std::size_t hash_dvec(const std::vector<double>& v) {
+    std::size_t h = std::hash<std::size_t>{}(v.size());
+    for (double x : v) {
+        h ^= std::hash<double>{}(x) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    }
+    return h;
+}
+
+class MftDevCache {
+public:
+    std::shared_ptr<DeviceMftMatrix> get_or_build(
+        const std::vector<double>& U,
+        const std::vector<double>& X,
+        double sign) {
+        const double s2pi = sign * kTwoPi;
+        const MftDevKey key{U.size(), X.size(), s2pi,
+                            hash_dvec(U), hash_dvec(X)};
+
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = pool_.find(key);
+        if (it != pool_.end()) return it->second;
+        if (pool_.size() >= kCap) pool_.erase(pool_.begin());
+
+        // Stage U and X to device, fire the matrix kernel, free U/X.
+        double* d_U = nullptr;
+        double* d_X = nullptr;
+        check_cuda(cudaMalloc(&d_U, sizeof(double) * U.size()),
+                   "cudaMalloc mft U failed");
+        check_cuda(cudaMalloc(&d_X, sizeof(double) * X.size()),
+                   "cudaMalloc mft X failed");
+        check_cuda(cudaMemcpy(d_U, U.data(), sizeof(double) * U.size(),
+                              cudaMemcpyHostToDevice),
+                   "H2D mft U failed");
+        check_cuda(cudaMemcpy(d_X, X.data(), sizeof(double) * X.size(),
+                              cudaMemcpyHostToDevice),
+                   "H2D mft X failed");
+
+        auto M = std::make_shared<DeviceMftMatrix>(U.size(), X.size());
+        const dim3 block(16, 16);
+        const dim3 grid((static_cast<unsigned>(X.size()) + block.x - 1) / block.x,
+                        (static_cast<unsigned>(U.size()) + block.y - 1) / block.y);
+        mft_matrix_kernel<<<grid, block>>>(M->d_M, d_U, d_X,
+                                           U.size(), X.size(), s2pi);
+        check_cuda(cudaGetLastError(),  "mft_matrix_kernel launch failed");
+        check_cuda(cudaDeviceSynchronize(),
+                   "cudaDeviceSynchronize mft matrix failed");
+
+        cudaFree(d_U);
+        cudaFree(d_X);
+
+        pool_.emplace(key, M);
+        return M;
+    }
+
+private:
+    static constexpr std::size_t kCap = 32;
+    std::unordered_map<MftDevKey, std::shared_ptr<DeviceMftMatrix>,
+                       MftDevKeyHash> pool_;
+    std::mutex mu_;
+};
+
+MftDevCache& mft_dev_cache() {
+    static MftDevCache c;
+    return c;
+}
+
+// ---------------------------------------------------------------------------
+// Device-side complex scratch pool (generic, by element count).
+//
+// Used for the wavefront, T, and O buffers of mft_forward_gpu /
+// mft_reverse_gpu. Each call grabs three independent scratches; the
+// cache holds up to kCap distinct sizes so a steady-state pipeline with
+// a few sizes is allocation-free.
+// ---------------------------------------------------------------------------
+
+struct DeviceComplexScratch {
+    cuDoubleComplex* d = nullptr;
+    std::size_t count = 0;
+    explicit DeviceComplexScratch(std::size_t n) : count(n) {
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d),
+                              sizeof(cuDoubleComplex) * n),
+                   "cudaMalloc scratch failed");
+    }
+    ~DeviceComplexScratch() { if (d) cudaFree(d); }
+    DeviceComplexScratch(const DeviceComplexScratch&) = delete;
+    DeviceComplexScratch& operator=(const DeviceComplexScratch&) = delete;
+};
+
+class ComplexScratchPool {
+public:
+    // Returns a buffer of at least `n` complex elements. Same buffer may
+    // be returned to multiple callers; callers should treat the
+    // contents as undefined. The shared_ptr lifetime guards eviction.
+    std::shared_ptr<DeviceComplexScratch> get(std::size_t n, int slot) {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto key = std::make_pair(n, slot);
+        auto it = pool_.find(key);
+        if (it != pool_.end()) return it->second;
+        if (pool_.size() >= kCap) pool_.erase(pool_.begin());
+        auto s = std::make_shared<DeviceComplexScratch>(n);
+        pool_.emplace(key, s);
+        return s;
+    }
+private:
+    struct PairHash {
+        std::size_t operator()(const std::pair<std::size_t, int>& p) const noexcept {
+            return std::hash<std::size_t>{}(p.first) ^ (std::hash<int>{}(p.second) << 1);
+        }
+    };
+    static constexpr std::size_t kCap = 48;
+    std::unordered_map<std::pair<std::size_t, int>,
+                       std::shared_ptr<DeviceComplexScratch>,
+                       PairHash> pool_;
+    std::mutex mu_;
+};
+
+ComplexScratchPool& complex_scratch_pool() {
+    static ComplexScratchPool p;
+    return p;
 }
 
 // cuBLAS row-major Z-gemm: C(m, n) = alpha * A(m, k) * B(k, n) + beta * C
@@ -449,48 +783,42 @@ Array2D<std::complex<double>> mft_forward_gpu(
 
     const double sign = (convention == '-') ? -1.0 : 1.0;
 
-    // Mx (npsf x N) and My (N x npsf), both row-major.
-    auto h_Mx = build_mft_matrix(Us, Xs, sign);  // (npsf, N)
-    auto h_My = build_mft_matrix(Xs, Us, sign);  // (N, npsf)  -- note flipped order
+    // Mx (npsf x N) and My (N x npsf) cached on the device. First call
+    // for a given (npix, npsf, du, sign, centering) pays a small kernel
+    // build cost; subsequent calls are free.
+    auto Mx = mft_dev_cache().get_or_build(Us, Xs, sign); // (npsf, N)
+    auto My = mft_dev_cache().get_or_build(Xs, Us, sign); // (N, npsf)
 
-    // Allocate device buffers.
-    cuDoubleComplex *d_W = nullptr, *d_Mx = nullptr, *d_My = nullptr,
-                    *d_T = nullptr, *d_O = nullptr;
-    const std::size_t W_bytes  = sizeof(cuDoubleComplex) * N * N;
-    const std::size_t Mx_bytes = sizeof(cuDoubleComplex) * npsf * N;
-    const std::size_t My_bytes = sizeof(cuDoubleComplex) * N * npsf;
-    const std::size_t T_bytes  = sizeof(cuDoubleComplex) * npsf * N;
-    const std::size_t O_bytes  = sizeof(cuDoubleComplex) * npsf * npsf;
-    check_cuda(cudaMalloc(&d_W,  W_bytes),  "cudaMalloc mft_fwd W");
-    check_cuda(cudaMalloc(&d_Mx, Mx_bytes), "cudaMalloc mft_fwd Mx");
-    check_cuda(cudaMalloc(&d_My, My_bytes), "cudaMalloc mft_fwd My");
-    check_cuda(cudaMalloc(&d_T,  T_bytes),  "cudaMalloc mft_fwd T");
-    check_cuda(cudaMalloc(&d_O,  O_bytes),  "cudaMalloc mft_fwd O");
+    // Scratch device buffers (W, T, O) drawn from the size-keyed pool.
+    auto W_buf = complex_scratch_pool().get(N * N,        /*slot=*/0);
+    auto T_buf = complex_scratch_pool().get(npsf * N,     /*slot=*/1);
+    auto O_buf = complex_scratch_pool().get(npsf * npsf,  /*slot=*/2);
 
-    check_cuda(cudaMemcpy(d_W,  wavefront.data(), W_bytes,  cudaMemcpyHostToDevice), "H2D W");
-    check_cuda(cudaMemcpy(d_Mx, h_Mx.data(),      Mx_bytes, cudaMemcpyHostToDevice), "H2D Mx");
-    check_cuda(cudaMemcpy(d_My, h_My.data(),      My_bytes, cudaMemcpyHostToDevice), "H2D My");
+    const std::size_t W_bytes = sizeof(cuDoubleComplex) * N * N;
+    const std::size_t O_bytes = sizeof(cuDoubleComplex) * npsf * npsf;
+
+    check_cuda(cudaMemcpy(W_buf->d, wavefront.data(), W_bytes,
+                          cudaMemcpyHostToDevice), "H2D W");
 
     cublasHandle_t handle = cublas_handle();
     const cuDoubleComplex one  = make_cuDoubleComplex(1.0, 0.0);
     const cuDoubleComplex zero = make_cuDoubleComplex(0.0, 0.0);
 
     // T = Mx @ W   (npsf x N) = (npsf x N)(N x N)
-    zgemm_rm(handle, npsf, N, N, d_Mx, d_W, d_T, one, zero);
+    zgemm_rm(handle, npsf, N, N, Mx->d_M, W_buf->d, T_buf->d, one, zero);
     // O = T @ My   (npsf x npsf) = (npsf x N)(N x npsf)
-    zgemm_rm(handle, npsf, npsf, N, d_T, d_My, d_O, one, zero);
+    zgemm_rm(handle, npsf, npsf, N, T_buf->d, My->d_M, O_buf->d, one, zero);
 
     // Scale by psf_pixelscale_lamD / npix in-place on the device.
     const double scale = psf_pixelscale_lamD / static_cast<double>(npix);
     const cuDoubleComplex scale_cplx = make_cuDoubleComplex(scale, 0.0);
     check_cublas(cublasZscal(handle, static_cast<int>(npsf * npsf),
-                              &scale_cplx, d_O, 1),
+                              &scale_cplx, O_buf->d, 1),
                  "cublasZscal mft_fwd scale");
 
     Array2D<std::complex<double>> out(npsf, npsf, {0.0, 0.0});
-    check_cuda(cudaMemcpy(out.data(), d_O, O_bytes, cudaMemcpyDeviceToHost), "D2H mft_fwd");
-
-    cudaFree(d_W); cudaFree(d_Mx); cudaFree(d_My); cudaFree(d_T); cudaFree(d_O);
+    check_cuda(cudaMemcpy(out.data(), O_buf->d, O_bytes,
+                          cudaMemcpyDeviceToHost), "D2H mft_fwd");
     return out;
 }
 
@@ -517,45 +845,39 @@ Array2D<std::complex<double>> mft_reverse_gpu(
 
     // Mx (N x npsf): exp(j*sign*2pi * Xs[x] * Us[u])
     // My (npsf x N): exp(j*sign*2pi * Us[v] * Xs[y])
-    auto h_Mx = build_mft_matrix(Xs, Us, sign);  // (N, npsf)
-    auto h_My = build_mft_matrix(Us, Xs, sign);  // (npsf, N)
+    auto Mx = mft_dev_cache().get_or_build(Xs, Us, sign);  // (N, npsf)
+    auto My = mft_dev_cache().get_or_build(Us, Xs, sign);  // (npsf, N)
 
-    cuDoubleComplex *d_F = nullptr, *d_Mx = nullptr, *d_My = nullptr,
-                    *d_T = nullptr, *d_O = nullptr;
-    const std::size_t F_bytes  = sizeof(cuDoubleComplex) * npsf * npsf;
-    const std::size_t Mx_bytes = sizeof(cuDoubleComplex) * N * npsf;
-    const std::size_t My_bytes = sizeof(cuDoubleComplex) * npsf * N;
-    const std::size_t T_bytes  = sizeof(cuDoubleComplex) * N * npsf;
-    const std::size_t O_bytes  = sizeof(cuDoubleComplex) * N * N;
-    check_cuda(cudaMalloc(&d_F,  F_bytes),  "cudaMalloc mft_rev F");
-    check_cuda(cudaMalloc(&d_Mx, Mx_bytes), "cudaMalloc mft_rev Mx");
-    check_cuda(cudaMalloc(&d_My, My_bytes), "cudaMalloc mft_rev My");
-    check_cuda(cudaMalloc(&d_T,  T_bytes),  "cudaMalloc mft_rev T");
-    check_cuda(cudaMalloc(&d_O,  O_bytes),  "cudaMalloc mft_rev O");
+    // Use disjoint scratch slots from the forward path so a mixed
+    // forward/reverse loop does not stomp each other's buffers.
+    auto F_buf = complex_scratch_pool().get(npsf * npsf, /*slot=*/3);
+    auto T_buf = complex_scratch_pool().get(N * npsf,    /*slot=*/4);
+    auto O_buf = complex_scratch_pool().get(N * N,       /*slot=*/5);
 
-    check_cuda(cudaMemcpy(d_F,  fpwf.data(),  F_bytes,  cudaMemcpyHostToDevice), "H2D F");
-    check_cuda(cudaMemcpy(d_Mx, h_Mx.data(),  Mx_bytes, cudaMemcpyHostToDevice), "H2D Mx");
-    check_cuda(cudaMemcpy(d_My, h_My.data(),  My_bytes, cudaMemcpyHostToDevice), "H2D My");
+    const std::size_t F_bytes = sizeof(cuDoubleComplex) * npsf * npsf;
+    const std::size_t O_bytes = sizeof(cuDoubleComplex) * N * N;
+
+    check_cuda(cudaMemcpy(F_buf->d, fpwf.data(), F_bytes,
+                          cudaMemcpyHostToDevice), "H2D F");
 
     cublasHandle_t handle = cublas_handle();
     const cuDoubleComplex one  = make_cuDoubleComplex(1.0, 0.0);
     const cuDoubleComplex zero = make_cuDoubleComplex(0.0, 0.0);
 
     // T = Mx @ F  (N x npsf) = (N x npsf)(npsf x npsf)
-    zgemm_rm(handle, N, npsf, npsf, d_Mx, d_F, d_T, one, zero);
+    zgemm_rm(handle, N, npsf, npsf, Mx->d_M, F_buf->d, T_buf->d, one, zero);
     // O = T @ My  (N x N) = (N x npsf)(npsf x N)
-    zgemm_rm(handle, N, N, npsf, d_T, d_My, d_O, one, zero);
+    zgemm_rm(handle, N, N, npsf, T_buf->d, My->d_M, O_buf->d, one, zero);
 
     const double scale = psf_pixelscale_lamD / static_cast<double>(npix);
     const cuDoubleComplex scale_cplx = make_cuDoubleComplex(scale, 0.0);
     check_cublas(cublasZscal(handle, static_cast<int>(N * N),
-                              &scale_cplx, d_O, 1),
+                              &scale_cplx, O_buf->d, 1),
                  "cublasZscal mft_rev scale");
 
     Array2D<std::complex<double>> out(N, N, {0.0, 0.0});
-    check_cuda(cudaMemcpy(out.data(), d_O, O_bytes, cudaMemcpyDeviceToHost), "D2H mft_rev");
-
-    cudaFree(d_F); cudaFree(d_Mx); cudaFree(d_My); cudaFree(d_T); cudaFree(d_O);
+    check_cuda(cudaMemcpy(out.data(), O_buf->d, O_bytes,
+                          cudaMemcpyDeviceToHost), "D2H mft_rev");
     return out;
 }
 

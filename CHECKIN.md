@@ -232,6 +232,28 @@ After that script finishes the parity suite should report a clean
 `46 passed, 1 xfailed` (or similar -- the actual number of tests grows
 over time).
 
+### Performance notes (CPU MFT, GPU FFT/MFT)
+
+Both `mft_forward` / `mft_reverse` and `fft` / `ifft` go through
+geometry-keyed caches:
+
+* **CPU MFT** computes `M_pre` and `M_post` once per
+  `(npix, npsf, du, convention, centering)` and reuses them via
+  `cblas_zgemm`. Steady-state cost = two BLAS calls.
+* **GPU MFT** builds `Mx` / `My` directly on the device with a CUDA
+  kernel, caches them in a `shared_ptr<DeviceMftMatrix>`, and reuses
+  device scratch buffers for `W`, `T`, `O` so a loop never calls
+  `cudaMalloc` / `cudaFree`.
+* **GPU FFT** caches the cuFFT plan, a pair of device scratch buffers
+  (per `(rows, cols)`), and runs on a dedicated CUDA stream. The
+  `fftshift` / `ifftshift` operations are GPU kernels (no host
+  copies); for the inverse FFT the `1/N` normalisation is fused into
+  the post-shift kernel.
+
+If a single benchmark call looks slow but subsequent ones are fast,
+the first call paid the cold-cache cost (plan, M matrices, device
+buffers). `lina_cpp.bench` already does a warmup call before timing.
+
 ### Troubleshooting: `test_gemv` fails on NVIDIA Jetson / aarch64
 
 If `test_gemv` reports the C++ result disagreeing with `A @ x`, your
@@ -293,8 +315,8 @@ Functions with `device=` support today:
 | `lina_cpp.props.fft`                    | FFTW        | cuFFT       |
 | `lina_cpp.props.ifft`                   | FFTW        | cuFFT       |
 | `lina_cpp.props.ang_spec`               | FFTW        | cuFFT       |
-| `lina_cpp.props.mft_forward`            | triple loop | cuBLAS zgemm|
-| `lina_cpp.props.mft_reverse`            | triple loop | cuBLAS zgemm|
+| `lina_cpp.props.mft_forward`            | OpenBLAS zgemm (cached M) | cuBLAS zgemm (cached M) |
+| `lina_cpp.props.mft_reverse`            | OpenBLAS zgemm (cached M) | cuBLAS zgemm (cached M) |
 | `lina_cpp.props.make_vortex_phase_mask` | OpenMP      | CUDA kernel |
 | `lina_cpp.props.get_fresnel_TF`         | OpenMP      | CUDA kernel |
 

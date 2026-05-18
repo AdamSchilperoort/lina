@@ -614,6 +614,12 @@ py::array_t<double> llowfsc_loop_step_wrapper(
 PYBIND11_MODULE(LINA_PYBIND_MODULE_NAME, m) {
     m.doc() = "Lina C++ bindings (pybind11) — math primitives for parity testing";
 
+    // Build stamp so a smoke test can confirm exactly which compiled
+    // .so was loaded. Bump LINA_BUILD_TAG whenever a C++ source change
+    // needs to be observable from Python.
+    m.attr("__build_tag__") = "llowfsc-safe-dot-row-noinline-2026.05.17";
+    m.attr("__build_date__") = __DATE__ " " __TIME__;
+
     // FFT
     m.def("fft_cpu", &fft_cpu_wrapper, py::arg("array"),
           "2D FFT (CPU/FFTW backend) with centered shifts");

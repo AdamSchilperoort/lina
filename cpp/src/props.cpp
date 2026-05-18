@@ -7,6 +7,7 @@
 #include <complex>
 #include <cstring>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -18,10 +19,106 @@
 #include <fftw3.h>
 #endif
 
+#ifdef LINA_USE_OPENBLAS
+#include <cblas.h>
+#endif
+
 namespace lina {
 namespace {
 
 constexpr double kTwoPi = 2.0 * M_PI;
+
+// ---------------------------------------------------------------------------
+// MFT matrix cache.
+//
+// Building M_pre / M_post is O(npix * npsf) complex exponentials. In a
+// typical wavefront-control loop the *geometry* (npix, npsf, du,
+// convention, centering) stays fixed across hundreds of iterations and
+// only the wavefront changes, so caching the M matrices turns
+// `mft_forward` into "two zgemms" -- matching the numpy reference that
+// precomputes the matrices once outside its timed loop.
+//
+// The cache is keyed on every parameter that affects the matrix, has a
+// modest LRU-style cap so it cannot grow unbounded in a long-running
+// process, and is guarded by a mutex so concurrent threads do not race
+// on the std::unordered_map.
+// ---------------------------------------------------------------------------
+
+struct MftKey {
+    std::size_t npix;
+    std::size_t npsf;
+    std::size_t N;          // wavefront side length (for mft_forward) or
+                            // pupil side length (for mft_reverse)
+    double du;              // psf_pixelscale_lamD
+    int sign;               // +1 or -1
+    int role;               // 0=mft_forward pre, 1=mft_forward post,
+                            // 2=mft_reverse Mx, 3=mft_reverse My
+    char pp_first;          // first char of pp_centering ('o' or 'e')
+    char fp_first;          // first char of fp_centering ('o' or 'e')
+
+    bool operator==(const MftKey& o) const noexcept {
+        return npix == o.npix && npsf == o.npsf && N == o.N
+            && du == o.du && sign == o.sign && role == o.role
+            && pp_first == o.pp_first && fp_first == o.fp_first;
+    }
+};
+
+struct MftKeyHash {
+    std::size_t operator()(const MftKey& k) const noexcept {
+        // Mix the integral fields; double goes through std::hash.
+        std::size_t h = std::hash<std::size_t>{}(k.npix);
+        h ^= std::hash<std::size_t>{}(k.npsf) + 0x9e3779b97f4a7c15ULL
+             + (h << 6) + (h >> 2);
+        h ^= std::hash<std::size_t>{}(k.N)    + 0x9e3779b97f4a7c15ULL
+             + (h << 6) + (h >> 2);
+        h ^= std::hash<double>{}(k.du)        + 0x9e3779b97f4a7c15ULL
+             + (h << 6) + (h >> 2);
+        const std::size_t packed = static_cast<std::size_t>(k.sign + 2)
+            | (static_cast<std::size_t>(k.role) << 4)
+            | (static_cast<std::size_t>(k.pp_first) << 8)
+            | (static_cast<std::size_t>(k.fp_first) << 16);
+        h ^= packed + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+using ComplexMatrix = Array2D<std::complex<double>>;
+using ComplexMatrixPtr = std::shared_ptr<const ComplexMatrix>;
+
+static std::mutex g_mft_cache_mu;
+static std::unordered_map<MftKey, ComplexMatrixPtr, MftKeyHash> g_mft_cache;
+constexpr std::size_t kMftCacheCap = 32;  // ~32 distinct geometries max
+
+// Returns a shared_ptr so eviction does not free a matrix that another
+// thread is still reading. The map holds one strong reference; each
+// caller keeps another until it finishes its zgemm.
+ComplexMatrixPtr mft_cache_get_or_build(
+    const MftKey& key,
+    std::size_t rows, std::size_t cols,
+    double sign,
+    const std::vector<double>& row_coords,
+    const std::vector<double>& col_coords) {
+    std::lock_guard<std::mutex> lk(g_mft_cache_mu);
+    auto it = g_mft_cache.find(key);
+    if (it != g_mft_cache.end()) {
+        return it->second;
+    }
+    if (g_mft_cache.size() >= kMftCacheCap) {
+        g_mft_cache.erase(g_mft_cache.begin());
+    }
+    auto M = std::make_shared<ComplexMatrix>(rows, cols,
+                                             std::complex<double>{0.0, 0.0});
+    const std::complex<double> j(0.0, 1.0);
+    for (std::size_t r = 0; r < rows; ++r) {
+        const double rc = row_coords[r];
+        for (std::size_t c = 0; c < cols; ++c) {
+            const double phase = sign * kTwoPi * rc * col_coords[c];
+            (*M)(r, c) = std::exp(j * phase);
+        }
+    }
+    auto [iter, inserted] = g_mft_cache.emplace(key, M);
+    return iter->second;
+}
 
 void shift_into_buffer(const std::complex<double>* src,
                        std::complex<double>* dst,
@@ -369,31 +466,89 @@ Array2D<std::complex<double>> mft_forward(
     const auto Us = build_coordinates(npsf, du, fp_centering);
 
     const double sign = (convention == '-') ? -1.0 : 1.0;
-    const std::complex<double> j(0.0, 1.0);
+    const double scale = psf_pixelscale_lamD / static_cast<double>(npix);
+
+    // Strategy: precompute the two MFT matrices ONCE per geometry
+    // (cached across calls -- see mft_cache_get_or_build), then
+    // dispatch the two matmuls to BLAS (zgemm). This mirrors what
+    // numpy does for ``M_pre @ wavefront @ M_post`` and brings the CPU
+    // MFT from O(npsf * npix^2) complex-exp evaluations down to
+    // (essentially zero matrix-build work + two highly-optimised zgemm
+    // calls) for the steady-state case where geometry is fixed.
+    //
+    //   M_pre[u, y] = exp(j * sign * 2π * Us[u] * Xs[y])        (npsf, N)
+    //   M_post[x, v] = exp(j * sign * 2π * Xs[x] * Us[v])        (N, npsf)
+    //
+    //   temp = M_pre @ wavefront                                 (npsf, N)
+    //   out  = scale * temp @ M_post                             (npsf, npsf)
+    const int isign = (convention == '-') ? -1 : 1;
+    const char pp0 = pp_centering ? pp_centering[0] : 'o';
+    const char fp0 = fp_centering ? fp_centering[0] : 'o';
+
+    MftKey k_pre {npix, npsf, N, du, isign, /*role=*/0, pp0, fp0};
+    auto M_pre_ptr = mft_cache_get_or_build(
+        k_pre, npsf, N, sign, Us, Xs);
+    const auto& M_pre = *M_pre_ptr;
+
+    MftKey k_post{npix, npsf, N, du, isign, /*role=*/1, pp0, fp0};
+    auto M_post_ptr = mft_cache_get_or_build(
+        k_post, N, npsf, sign, Xs, Us);
+    const auto& M_post = *M_post_ptr;
 
     Array2D<std::complex<double>> temp(npsf, N, {0.0, 0.0});
+    Array2D<std::complex<double>> out(npsf, npsf, {0.0, 0.0});
+
+#ifdef LINA_USE_OPENBLAS
+    // temp = 1 * M_pre @ wavefront + 0 * temp
+    {
+        const std::complex<double> alpha(1.0, 0.0);
+        const std::complex<double> beta(0.0, 0.0);
+        cblas_zgemm(
+            CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            static_cast<int>(npsf), static_cast<int>(N), static_cast<int>(N),
+            &alpha,
+            M_pre.data(),     static_cast<int>(N),
+            wavefront.data(), static_cast<int>(N),
+            &beta,
+            temp.data(),      static_cast<int>(N));
+    }
+    // out = scale * temp @ M_post + 0 * out
+    {
+        const std::complex<double> alpha(scale, 0.0);
+        const std::complex<double> beta(0.0, 0.0);
+        cblas_zgemm(
+            CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            static_cast<int>(npsf), static_cast<int>(npsf), static_cast<int>(N),
+            &alpha,
+            temp.data(),   static_cast<int>(N),
+            M_post.data(), static_cast<int>(npsf),
+            &beta,
+            out.data(),    static_cast<int>(npsf));
+    }
+#else
+    // Fallback hand-rolled matmuls. Still much faster than the prior
+    // exp-in-inner-loop implementation because the M matrices are
+    // built once. Acceptable because users without OpenBLAS get a
+    // working (if not blazing) MFT.
     for (std::size_t u = 0; u < npsf; ++u) {
         for (std::size_t x = 0; x < N; ++x) {
             std::complex<double> sum(0.0, 0.0);
             for (std::size_t y = 0; y < N; ++y) {
-                const double phase = sign * kTwoPi * Us[u] * Xs[y];
-                sum += wavefront(y, x) * std::exp(j * phase);
+                sum += M_pre(u, y) * wavefront(y, x);
             }
             temp(u, x) = sum;
         }
     }
-
-    Array2D<std::complex<double>> out(npsf, npsf, {0.0, 0.0});
     for (std::size_t u = 0; u < npsf; ++u) {
         for (std::size_t v = 0; v < npsf; ++v) {
             std::complex<double> sum(0.0, 0.0);
             for (std::size_t x = 0; x < N; ++x) {
-                const double phase = sign * kTwoPi * Xs[x] * Us[v];
-                sum += temp(u, x) * std::exp(j * phase);
+                sum += temp(u, x) * M_post(x, v);
             }
-            out(u, v) = sum * (psf_pixelscale_lamD / static_cast<double>(npix));
+            out(u, v) = sum * scale;
         }
     }
+#endif
 
     return out;
 }
@@ -419,36 +574,75 @@ Array2D<std::complex<double>> mft_reverse(
     const auto Xs = build_coordinates(N, dx, pp_centering);
 
     const double sign = (convention == '+') ? 1.0 : -1.0;
-    const std::complex<double> j(0.0, 1.0);
+    const double scale = psf_pixelscale_lamD / static_cast<double>(npix);
 
-    // Computes out = Mx @ fpwf @ My with
-    //   Mx[x, u] = exp(j * sign * 2π * Xs[x] * Us[u])
-    //   My[v, y] = exp(j * sign * 2π * Us[v] * Xs[y])
-    // (matches Python lina.props.make_mft_reverse_matrices). The previous
-    // factorization produced the transpose of the correct result.
+    // Same precompute-then-BLAS strategy as mft_forward, with caching.
+    //   Mx[x, u]  = exp(j * sign * 2π * Xs[x] * Us[u])       (N, npsf)
+    //   My[v, y]  = exp(j * sign * 2π * Us[v] * Xs[y])       (npsf, N)
+    //   temp      = Mx @ fpwf                                 (N, npsf)
+    //   out       = scale * temp @ My                         (N, N)
+    const int isign = (convention == '+') ? 1 : -1;
+    const char pp0 = pp_centering ? pp_centering[0] : 'o';
+    const char fp0 = fp_centering ? fp_centering[0] : 'o';
+
+    MftKey k_x {npix, npsf, N, du, isign, /*role=*/2, pp0, fp0};
+    auto Mx_ptr = mft_cache_get_or_build(
+        k_x, N, npsf, sign, Xs, Us);
+    const auto& Mx = *Mx_ptr;
+
+    MftKey k_y {npix, npsf, N, du, isign, /*role=*/3, pp0, fp0};
+    auto My_ptr = mft_cache_get_or_build(
+        k_y, npsf, N, sign, Us, Xs);
+    const auto& My = *My_ptr;
+
     Array2D<std::complex<double>> temp(N, npsf, {0.0, 0.0});
+    Array2D<std::complex<double>> out(N, N, {0.0, 0.0});
+
+#ifdef LINA_USE_OPENBLAS
+    {
+        const std::complex<double> alpha(1.0, 0.0);
+        const std::complex<double> beta(0.0, 0.0);
+        cblas_zgemm(
+            CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            static_cast<int>(N), static_cast<int>(npsf), static_cast<int>(npsf),
+            &alpha,
+            Mx.data(),   static_cast<int>(npsf),
+            fpwf.data(), static_cast<int>(npsf),
+            &beta,
+            temp.data(), static_cast<int>(npsf));
+    }
+    {
+        const std::complex<double> alpha(scale, 0.0);
+        const std::complex<double> beta(0.0, 0.0);
+        cblas_zgemm(
+            CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            static_cast<int>(N), static_cast<int>(N), static_cast<int>(npsf),
+            &alpha,
+            temp.data(), static_cast<int>(npsf),
+            My.data(),   static_cast<int>(N),
+            &beta,
+            out.data(),  static_cast<int>(N));
+    }
+#else
     for (std::size_t x = 0; x < N; ++x) {
         for (std::size_t v = 0; v < npsf; ++v) {
             std::complex<double> sum(0.0, 0.0);
             for (std::size_t u = 0; u < npsf; ++u) {
-                const double phase = sign * kTwoPi * Xs[x] * Us[u];
-                sum += std::exp(j * phase) * fpwf(u, v);
+                sum += Mx(x, u) * fpwf(u, v);
             }
             temp(x, v) = sum;
         }
     }
-
-    Array2D<std::complex<double>> out(N, N, {0.0, 0.0});
     for (std::size_t x = 0; x < N; ++x) {
         for (std::size_t y = 0; y < N; ++y) {
             std::complex<double> sum(0.0, 0.0);
             for (std::size_t v = 0; v < npsf; ++v) {
-                const double phase = sign * kTwoPi * Us[v] * Xs[y];
-                sum += temp(x, v) * std::exp(j * phase);
+                sum += temp(x, v) * My(v, y);
             }
-            out(x, y) = sum * (psf_pixelscale_lamD / static_cast<double>(npix));
+            out(x, y) = sum * scale;
         }
     }
+#endif
 
     return out;
 }

@@ -98,6 +98,26 @@ def test_import() -> bool:
         [s for s in dir(lina_cpp._core) if not s.startswith("_")]
     )
     print(f"{INFO} _core exports     = {ncore_syms} symbols")
+    # Build stamp: confirms which version of the C++ source was
+    # compiled into the loaded .so. If this doesn't match a known
+    # tag from cpp/pybind/lina_py.cpp, the binary on disk is older
+    # than the C++ tree.
+    build_tag = getattr(lina_cpp._core, "__build_tag__", "(no build tag)")
+    build_date = getattr(lina_cpp._core, "__build_date__", "(unknown)")
+    print(f"{INFO} _core build tag   = {build_tag}")
+    print(f"{INFO} _core compiled at = {build_date}")
+    # mtime of the actual .so on disk: catches editable-install rebuild
+    # failures where setup.py reports success but didn't write the .so.
+    try:
+        import os
+        ext_file = getattr(lina_cpp._core, "__file__", None)
+        if ext_file and os.path.exists(ext_file):
+            import datetime as _dt
+            mtime = _dt.datetime.fromtimestamp(os.path.getmtime(ext_file))
+            print(f"{INFO} _core.so on disk  = {ext_file}")
+            print(f"{INFO} _core.so mtime    = {mtime.isoformat(' ')}")
+    except Exception:  # noqa: BLE001
+        pass
     # Toolchain info -- useful when a miscompilation creeps in.
     try:
         import numpy
