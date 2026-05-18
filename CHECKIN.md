@@ -137,25 +137,112 @@ sudo apt-get install -y build-essential cmake \
 pip install -e .                       # installs `lina`
 pip install scipy numpy poppy pybind11
 
-# 4) Build + install lina_cpp (CPU only)
+# 4) Build + install lina_cpp.
+#
+#    GPU support is auto-detected: if a working CUDA toolkit is on PATH,
+#    the GPU backend (cuFFT, cuBLAS, cuSOLVER, custom kernels) is
+#    enabled automatically. Watch the build log for:
+#
+#        === lina_cpp configuration ===
+#          GPU backend : ENABLED  (cuFFT, cuBLAS, cuSOLVER, custom kernels)
+#
+#    or, on a CPU-only host:
+#
+#          GPU backend : disabled (CPU-only build)
+#
 pip install -e ./lina_cpp/
 
-# 5) Run the parity suite
-python -m pytest lina/tests/test_per_method_parity.py -v
+# 5) Verify
+python -c "import lina_cpp; print('GPU:', lina_cpp.gpu_available())"
 
-# 6) (Optional) Build with CUDA enabled
-#    Requires CUDA Toolkit 12.4+ and a compatible host gcc.
-#    See cpp/CMakeLists.txt header note about the CUDA 12.4 + glibc 2.40
-#    incompatibility on Debian 13.
-cmake -S cpp -B cpp/build-cuda \
-    -DLINA_USE_CUDA=ON \
-    -DLINA_BUILD_PYBIND=ON \
-    -DCMAKE_CUDA_ARCHITECTURES="86" \
-    -DCMAKE_BUILD_TYPE=Release
-cmake --build cpp/build-cuda -j
-# Re-install lina_cpp so it picks up the GPU-enabled extension:
-pip install --force-reinstall --no-deps -e ./lina_cpp/
+# 6) Run the parity suite
+python -m pytest lina/tests/test_per_method_parity.py -v
 ```
+
+### Forcing GPU on or off
+
+If you want to override the auto-detect (e.g. you have CUDA installed
+but want a CPU-only build, or you have a non-standard toolkit layout
+and want to force GPU and fail loudly if it can't link), set
+`LINA_USE_CUDA` before `pip install`:
+
+```bash
+# Force GPU build (fails the build if CUDA isn't available):
+LINA_USE_CUDA=1 pip install --force-reinstall --no-deps -e ./lina_cpp/
+
+# Force CPU-only build (skip the auto-detect probe):
+LINA_USE_CUDA=0 pip install --force-reinstall --no-deps -e ./lina_cpp/
+
+# Pick a specific CUDA architecture:
+LINA_USE_CUDA=1 LINA_CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=89" \
+    pip install --force-reinstall --no-deps -e ./lina_cpp/
+```
+
+If you previously installed without CUDA and now want to enable it,
+remember to add `--force-reinstall --no-deps` or pip will short-circuit
+the rebuild and you'll still see `gpu_available() == False`.
+
+> **Note on CUDA 12.4 + glibc 2.40 (Debian 13)**: `nvcc` from CUDA 12.4
+> fails to compile against Debian 13's glibc 2.40. Use CUDA 12.6+, or
+> downgrade to glibc 2.39, or build inside an Ubuntu 22.04 container.
+> See the header note in `cpp/CMakeLists.txt`.
+
+## 4b. Choosing CPU vs GPU at runtime
+
+Every math hot path in `lina_cpp.props` has both a CPU and a GPU C++
+implementation (FFTW / OpenBLAS for CPU; cuFFT / cuBLAS / cuSOLVER for
+GPU). You select between them three ways:
+
+```python
+import lina_cpp
+import numpy as np
+
+# 1. Check what this build supports
+lina_cpp.gpu_available()        # True iff compiled with -DLINA_USE_CUDA=ON
+lina_cpp.get_device()           # 'cpu' or 'gpu'
+
+# 2. Module-level default (sticky for the rest of the session)
+lina_cpp.set_device("gpu")      # all subsequent calls go to GPU
+lina_cpp.set_device("cpu")      # back to CPU
+
+# 3. Per-call override
+ft_gpu = lina_cpp.props.fft(arr, device="gpu")
+ft_cpu = lina_cpp.props.fft(arr, device="cpu")
+psf    = lina_cpp.props.mft_forward(wf, npix, npsf, du, device="gpu")
+```
+
+You can also set the default from the environment, which is useful for
+benchmarking scripts and notebooks:
+
+```bash
+LINA_CPP_DEVICE=gpu jupyter lab
+LINA_CPP_DEVICE=cpu python bench.py
+```
+
+Behavior on a CPU-only build (`LINA_USE_CUDA=OFF`):
+- `lina_cpp.gpu_available()` returns `False`.
+- `lina_cpp.set_device("gpu")` raises `RuntimeError` (so you can't
+  silently end up on CPU when you wanted GPU).
+- A per-call `device="gpu"` falls back to CPU and emits a one-shot
+  `RuntimeWarning` so you know what happened.
+
+Functions with `device=` support today:
+
+| Function                                | CPU backend | GPU backend |
+| --------------------------------------- | ----------- | ----------- |
+| `lina_cpp.props.fft`                    | FFTW        | cuFFT       |
+| `lina_cpp.props.ifft`                   | FFTW        | cuFFT       |
+| `lina_cpp.props.ang_spec`               | FFTW        | cuFFT       |
+| `lina_cpp.props.mft_forward`            | triple loop | cuBLAS zgemm|
+| `lina_cpp.props.mft_reverse`            | triple loop | cuBLAS zgemm|
+| `lina_cpp.props.make_vortex_phase_mask` | OpenMP      | CUDA kernel |
+| `lina_cpp.props.get_fresnel_TF`         | OpenMP      | CUDA kernel |
+
+Other modules (`utils`, `dm`, `efc`, `iefc`, `aefc`, `llowfsc`, `wfe`)
+are CPU-only in the C++ extension today; their wrappers accept (and
+ignore with a one-shot warning) a `device=` kwarg so that user code
+written against the dispatch API doesn't break when those eventually
+get GPU kernels.
 
 ## 5. After it's tested and you want to merge into the original `lina` repo
 

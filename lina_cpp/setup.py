@@ -11,10 +11,26 @@ Build steps:
    ``LINA_PYBIND_MODULE_NAME=_core`` so the .so is named ``_core``.
 3. Build, then copy the .so into the staged package directory.
 
-Pass ``-DLINA_USE_CUDA=ON`` via the env var ``LINA_CMAKE_ARGS`` for a
-GPU build, e.g.::
+GPU support
+-----------
 
-    LINA_CMAKE_ARGS="-DLINA_USE_CUDA=ON" pip install -e .
+By default the CMake configure step auto-detects whether a working
+CUDA toolkit is available on the system and turns on the GPU backend
+(cuFFT, cuBLAS, cuSOLVER, and custom kernels) when it is. If you want
+to force or forbid the GPU build, use one of these knobs:
+
+* ``LINA_USE_CUDA=1`` / ``LINA_USE_CUDA=0`` env var (simplest)::
+
+    LINA_USE_CUDA=1 pip install -e ./lina_cpp/
+    LINA_USE_CUDA=0 pip install -e ./lina_cpp/
+
+* Or the more general ``LINA_CMAKE_ARGS`` escape hatch::
+
+    LINA_CMAKE_ARGS="-DLINA_USE_CUDA=ON" pip install -e ./lina_cpp/
+
+After install, verify with::
+
+    python -c "import lina_cpp; print('GPU:', lina_cpp.gpu_available())"
 
 """
 
@@ -92,8 +108,26 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={ext_dir}",
         ]
 
+        # Simple env-var toggle for the most common case: GPU build yes/no.
+        # Accepts 1/0/on/off/true/false/yes/no/auto (any other value falls
+        # through to the auto-detect path in CMakeLists.txt).
+        cuda_env = os.environ.get("LINA_USE_CUDA", "").strip().lower()
+        if cuda_env in ("1", "on", "true", "yes"):
+            cmake_args.append("-DLINA_USE_CUDA=ON")
+            print("[lina_cpp] LINA_USE_CUDA=1 set; forcing GPU build "
+                  "(will fail if no CUDA toolkit available).")
+        elif cuda_env in ("0", "off", "false", "no"):
+            cmake_args.append("-DLINA_USE_CUDA=OFF")
+            print("[lina_cpp] LINA_USE_CUDA=0 set; forcing CPU-only build.")
+        else:
+            if cuda_env and cuda_env != "auto":
+                print(f"[lina_cpp] LINA_USE_CUDA={cuda_env!r} not "
+                      "recognised; falling through to CMake auto-detect.")
+            print("[lina_cpp] LINA_USE_CUDA not set; CMake will auto-detect "
+                  "CUDA. Set LINA_USE_CUDA=1 to force GPU, =0 for CPU.")
+
         # Allow the caller to inject extra CMake flags, e.g.
-        # LINA_CMAKE_ARGS="-DLINA_USE_CUDA=ON".
+        # LINA_CMAKE_ARGS="-DLINA_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89".
         if extra := os.environ.get("LINA_CMAKE_ARGS"):
             cmake_args.extend(extra.split())
 
