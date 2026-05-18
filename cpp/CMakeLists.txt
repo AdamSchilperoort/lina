@@ -30,7 +30,21 @@ option(LINA_USE_CFITSIO "Enable native FITS I/O via cfitsio" ON)
 
 set(MAGAOX_VENDOR_ROOT "/opt/MagAOX/vendor" CACHE PATH "MagAOX vendor dependency root")
 option(LINA_BUILD_SHARED "Build shared library" ON)
-set(IMAGESTREAMIO_ROOT "/opt/MagAOX/source/milk/src/ImageStreamIO" CACHE PATH "Root of ImageStreamIO source/build")
+# ImageStreamIO from milk. We split the search into two roots so that we
+# handle the (very common) milk layout where the source tree and the
+# build tree are siblings:
+#     /opt/MagAOX/source/milk/src/ImageStreamIO    <- headers
+#     /opt/MagAOX/source/milk/_build/src/ImageStreamIO  <- libImageStreamIO.so
+# IMAGESTREAMIO_ROOT     -> directory containing ImageStreamIO.h
+# IMAGESTREAMIO_LIB_DIR  -> directory containing libImageStreamIO.so/.a
+# If only IMAGESTREAMIO_ROOT is set, we also probe several reasonable
+# sibling build dirs automatically.
+set(IMAGESTREAMIO_ROOT "/opt/MagAOX/source/milk/src/ImageStreamIO"
+    CACHE PATH "Root of ImageStreamIO source (directory containing ImageStreamIO.h)")
+set(IMAGESTREAMIO_LIB_DIR ""
+    CACHE PATH "Directory containing libImageStreamIO.so (leave empty to auto-probe)")
+set(MILK_BUILD_ROOT "/opt/MagAOX/source/milk/_build"
+    CACHE PATH "Root of milk CMake build tree (where _build/src/ImageStreamIO lives)")
 
 # --- CUDA auto-detection -----------------------------------------------------
 # If the user did not pass -DLINA_USE_CUDA=ON/OFF explicitly, probe for
@@ -270,24 +284,62 @@ if(LINA_USE_CFITSIO)
     endif()
 endif()
 
+# --- ImageStreamIO (optional) -----------------------------------------------
+# ImageStreamIO is the MagAOX/milk shared-memory image library. It is ONLY
+# used by src/shmim_utils.cpp to plug lina into the MagAOX realtime stack.
+# For parity testing, performance benchmarking, and notebook use it is not
+# required -- the shmim functions are already gated behind
+# LINA_USE_IMAGESTREAMIO and throw "ImageStreamIO not enabled" at runtime
+# when called without the library. So we look for it, but a missing
+# ImageStreamIO is a warning, not a fatal error.
+option(LINA_USE_IMAGESTREAMIO_REQUIRED "Treat missing ImageStreamIO as a fatal error" OFF)
+
 find_path(IMAGESTREAMIO_INCLUDE_DIR ImageStreamIO.h
-          HINTS ${IMAGESTREAMIO_ROOT} ${IMAGESTREAMIO_ROOT}/include)
+          HINTS ${IMAGESTREAMIO_ROOT}
+                ${IMAGESTREAMIO_ROOT}/include
+          PATHS /opt/MagAOX/source/milk/src/ImageStreamIO
+                /usr/local/milk/include
+                /usr/include/milk)
+
+# Library probe: try in this order
+#   1. Explicit user override (IMAGESTREAMIO_LIB_DIR)
+#   2. Sibling milk _build tree (the standard layout when milk is built
+#      out-of-source with cmake)
+#   3. In-source build subdirs (older milk / cibuildwheel layouts)
+#   4. System install prefixes
 find_library(IMAGESTREAMIO_LIBRARY ImageStreamIO
              HINTS
-             ${IMAGESTREAMIO_ROOT}/build
-             ${IMAGESTREAMIO_ROOT}/build/temp.linux-x86_64-cpython-310
-             ${IMAGESTREAMIO_ROOT}/build/lib.linux-x86_64-cpython-310
-             ${IMAGESTREAMIO_ROOT}/lib)
+                 ${IMAGESTREAMIO_LIB_DIR}
+                 ${MILK_BUILD_ROOT}/src/ImageStreamIO
+                 ${MILK_BUILD_ROOT}/lib
+                 ${IMAGESTREAMIO_ROOT}/../../_build/src/ImageStreamIO
+                 ${IMAGESTREAMIO_ROOT}/build
+                 ${IMAGESTREAMIO_ROOT}/build/temp.linux-x86_64-cpython-310
+                 ${IMAGESTREAMIO_ROOT}/build/lib.linux-x86_64-cpython-310
+                 ${IMAGESTREAMIO_ROOT}/lib
+             PATHS /usr/local/milk/lib
+                   /usr/local/lib
+                   /usr/lib/x86_64-linux-gnu)
 
-if(NOT IMAGESTREAMIO_INCLUDE_DIR OR NOT IMAGESTREAMIO_LIBRARY)
-    message(FATAL_ERROR "ImageStreamIO not found. Set IMAGESTREAMIO_ROOT to the ImageStreamIO source/build root.")
+if(IMAGESTREAMIO_INCLUDE_DIR AND IMAGESTREAMIO_LIBRARY)
+    message(STATUS "lina: ImageStreamIO FOUND at ${IMAGESTREAMIO_LIBRARY}")
+    foreach(target IN LISTS LINA_TARGETS)
+        target_compile_definitions(${target} PUBLIC LINA_USE_IMAGESTREAMIO)
+        target_include_directories(${target} PUBLIC ${IMAGESTREAMIO_INCLUDE_DIR})
+        target_link_libraries(${target} PUBLIC ${IMAGESTREAMIO_LIBRARY})
+    endforeach()
+elseif(LINA_USE_IMAGESTREAMIO_REQUIRED)
+    message(FATAL_ERROR
+        "ImageStreamIO not found and LINA_USE_IMAGESTREAMIO_REQUIRED=ON. "
+        "Set IMAGESTREAMIO_ROOT to the ImageStreamIO source/build root, "
+        "or pass -DLINA_USE_IMAGESTREAMIO_REQUIRED=OFF (the default).")
+else()
+    message(STATUS "lina: ImageStreamIO NOT found; lina::shmim_utils "
+        "functions will throw 'ImageStreamIO not enabled' at runtime. "
+        "This is fine for parity testing and notebook use. For the "
+        "MagAOX shared-memory realtime stack, install ImageStreamIO and "
+        "set -DIMAGESTREAMIO_ROOT=/path/to/ImageStreamIO.")
 endif()
-
-foreach(target IN LISTS LINA_TARGETS)
-    target_compile_definitions(${target} PUBLIC LINA_USE_IMAGESTREAMIO)
-    target_include_directories(${target} PUBLIC ${IMAGESTREAMIO_INCLUDE_DIR})
-    target_link_libraries(${target} PUBLIC ${IMAGESTREAMIO_LIBRARY})
-endforeach()
 
 install(TARGETS lina_cpp
         ARCHIVE DESTINATION lib
@@ -371,6 +423,11 @@ if(CFITSIO_LIBRARY)
     message(STATUS "  FITS I/O    : cfitsio (${CFITSIO_LIBRARY})")
 else()
     message(STATUS "  FITS I/O    : disabled (no cfitsio)")
+endif()
+if(IMAGESTREAMIO_LIBRARY)
+    message(STATUS "  shmim       : ImageStreamIO (${IMAGESTREAMIO_LIBRARY})")
+else()
+    message(STATUS "  shmim       : disabled (no ImageStreamIO; runtime stubs)")
 endif()
 message(STATUS "==============================")
 message(STATUS "")

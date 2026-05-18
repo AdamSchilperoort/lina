@@ -140,8 +140,25 @@ class CMakeBuild(build_ext):
             print("[lina_cpp] LINA_USE_CUDA not set; CMake will auto-detect "
                   "CUDA. Set LINA_USE_CUDA=1 to force GPU, =0 for CPU.")
 
+        # ImageStreamIO / milk paths can be passed as plain env vars,
+        # which is much friendlier than constructing LINA_CMAKE_ARGS.
+        # All three are optional; CMake will auto-probe when they're unset.
+        path_env_vars = (
+            ("IMAGESTREAMIO_ROOT", "IMAGESTREAMIO_ROOT"),
+            ("IMAGESTREAMIO_LIB_DIR", "IMAGESTREAMIO_LIB_DIR"),
+            ("MILK_BUILD_ROOT", "MILK_BUILD_ROOT"),
+        )
+        path_args: list[str] = []
+        for env_name, cmake_var in path_env_vars:
+            value = os.environ.get(env_name, "").strip()
+            if value:
+                print(f"[lina_cpp] {env_name}={value} (-> -D{cmake_var})")
+                path_args.append(f"-D{cmake_var}={value}")
+
         # Extra user-supplied CMake flags (e.g. CUDA_ARCHITECTURES).
-        extra_args = (os.environ.get("LINA_CMAKE_ARGS") or "").split()
+        extra_args = path_args + (
+            os.environ.get("LINA_CMAKE_ARGS") or ""
+        ).split()
 
         build_args = ["--config", cfg, "--target", "lina_py"]
         if jobs := os.environ.get("LINA_BUILD_JOBS"):
