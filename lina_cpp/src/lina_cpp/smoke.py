@@ -206,6 +206,71 @@ def test_dm_mask() -> bool:
         return _err("lina_cpp.dm.create_mask", exc)
 
 
+def test_llowfsc_reconstruct_sanity() -> bool:
+    """Catch the 'stale _core.so' symptom on the user's server.
+
+    The C++ ``llowfsc_reconstruct`` computes ``coeff[k] = C[mode_lo+k]
+    @ del_im[mask]``. For random inputs each coefficient must differ.
+    A binary that returns ``[c0, c0, c0, ...]`` (every entry equal to
+    coeff[0]) is the canonical signature of a stale or miscompiled
+    extension where the per-row pointer is being hoisted out of the
+    inner loop. Bail loudly with rebuild instructions when we see it.
+    """
+    _section("llowfsc_reconstruct sanity (catches stale _core.so)")
+    try:
+        import lina_cpp
+    except BaseException as exc:
+        return _err("import lina_cpp", exc)
+
+    rng = np.random.default_rng(8)
+    H = W = 32
+    Nmodes = 10
+    camlo = 5.0 + 0.1 * rng.standard_normal((H, W))
+    mask = (rng.standard_normal((H, W)) > 0.0).astype(np.uint8)
+    ref = 0.001 * rng.standard_normal((H, W))
+    Nmask = int(mask.sum())
+    C = rng.standard_normal((Nmodes, Nmask))
+
+    try:
+        coeff = np.asarray(lina_cpp.llowfsc_reconstruct(
+            camlo, ref, mask, C,
+            mode_lo=0, mode_hi=Nmodes,
+            dark_im=0.0, flux_norm=True, return_del_im=False,
+        ))
+    except BaseException as exc:
+        return _err("llowfsc_reconstruct call", exc)
+
+    if coeff.shape != (Nmodes,):
+        return _record(
+            "llowfsc_reconstruct shape", False,
+            f"expected ({Nmodes},), got {coeff.shape}",
+        )
+
+    spread = float(coeff.max() - coeff.min())
+    n_unique = int(np.unique(np.round(coeff, 12)).size)
+    is_constant = n_unique <= 1 or spread < 1e-12
+
+    if is_constant:
+        msg = (
+            f"output is constant ({coeff[0]:+.6f} x {Nmodes}). "
+            "This is the 'stale binary' bug -- the C++ source is correct "
+            "but your compiled _core.so was built from an older/buggy "
+            "intermediate state. Wipe it and reinstall:\n"
+            "    rm -rf lina_cpp/build lina_cpp/src/lina_cpp/_core*.so\n"
+            "    pip uninstall -y lina_cpp\n"
+            "    pip install -e ./lina_cpp/ --no-build-isolation "
+            "--force-reinstall --no-cache-dir"
+        )
+        return _record("llowfsc_reconstruct produces non-constant vector",
+                       False, msg)
+
+    return _record(
+        "llowfsc_reconstruct produces non-constant vector",
+        True,
+        f"spread = {spread:.3e}, {n_unique} distinct values out of {Nmodes}",
+    )
+
+
 def test_gpu_parity_with_cpu() -> bool:
     """When CUDA was compiled in, GPU primitives must match CPU."""
     _section("GPU parity with CPU")
@@ -322,6 +387,7 @@ def main() -> int:
         ok &= test_fft_roundtrip()
         ok &= test_cpu_parity_with_lina()
         ok &= test_dm_mask()
+        ok &= test_llowfsc_reconstruct_sanity()
         ok &= test_gpu_parity_with_cpu()
         ok &= test_cpu_vs_gpu_timings()
     except BaseException:

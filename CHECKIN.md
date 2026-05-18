@@ -187,6 +187,42 @@ the rebuild and you'll still see `gpu_available() == False`.
 > downgrade to glibc 2.39, or build inside an Ubuntu 22.04 container.
 > See the header note in `cpp/CMakeLists.txt`.
 
+### Troubleshooting: stale `_core.so`
+
+`pip install -e .` does **not** always recompile the C++ extension when
+only the C++ sources change. Setuptools sees no new `.py` files and
+skips `build_ext`. CMake also reuses `lina_cpp/build/` across runs, so a
+half-built `.so` from a failed earlier attempt can stick around.
+
+The canonical symptom of a stale binary on the parity suite is
+`lina_cpp.llowfsc_reconstruct` returning a constant vector (every
+coefficient equal to `coeff[0]`), which then triggers a cascade of
+"constant DESIRED array" failures in
+`lina/tests/test_per_method_parity.py::TestLlowfsc::*` and
+`TestWfe::*`. The smoke test catches this explicitly:
+
+```bash
+python -m lina_cpp.smoke
+# ...
+# === llowfsc_reconstruct sanity (catches stale _core.so) ===
+#   [FAIL] llowfsc_reconstruct produces non-constant vector: output is constant ...
+```
+
+If you ever see that, run the nuclear rebuild helper which wipes every
+cache layer (the editable-install hash, the cmake build dir, the
+in-tree `_core*.so`, the pip download cache) and re-installs:
+
+```bash
+bash scripts/clean_rebuild_lina_cpp.sh
+# or, to force a specific backend:
+LINA_USE_CUDA=1 bash scripts/clean_rebuild_lina_cpp.sh   # force GPU
+LINA_USE_CUDA=0 bash scripts/clean_rebuild_lina_cpp.sh   # force CPU
+```
+
+After that script finishes the parity suite should report a clean
+`46 passed, 1 xfailed` (or similar -- the actual number of tests grows
+over time).
+
 ## 4b. Choosing CPU vs GPU at runtime
 
 Every math hot path in `lina_cpp.props` has both a CPU and a GPU C++
