@@ -210,7 +210,7 @@ def run(efc_data,
             if not plot_all: clear_output(wait=True)
             utils.imshow(
                 [del_command, total_command, metric_im_ni], 
-                titles=[f'Iteration {starting_itr + i:d}: $\delta$DM', 
+                titles=[rf'Iteration {starting_itr + i:d}: $\delta$DM', 
                         'Total DM Command', 
                         f'Normalized Image\nMean Contrast = {contrast:.3e}'],
                 cmaps=['viridis', 'viridis', 'magma'],

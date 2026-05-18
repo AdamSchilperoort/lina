@@ -439,7 +439,7 @@ def plot_radial_contrast(im, mask, pixelscale, nbins=30, cenyx=None, xlims=None,
 
     fig,ax = plt.subplots(nrows=1, ncols=1, dpi=125, figsize=(6,4))
     ax.semilogy(r,contrast)
-    ax.set_xlabel('radial position [$\lambda/D$]')
+    ax.set_xlabel(r'radial position [$\lambda/D$]')
     ax.set_ylabel('Contrast')
     ax.grid()
     if xlims is not None: ax.set_xlim(xlims[0], xlims[1])
