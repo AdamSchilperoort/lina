@@ -94,7 +94,7 @@ class CMakeBuild(build_ext):
 
         cfg = "Debug" if self.debug else "Release"
 
-        cmake_args = [
+        common_args = [
             f"-DCMAKE_BUILD_TYPE={cfg}",
             "-DLINA_BUILD_PYBIND=ON",
             # The pybind module's PYBIND11_MODULE() macro expands to this
@@ -112,12 +112,26 @@ class CMakeBuild(build_ext):
         # Accepts 1/0/on/off/true/false/yes/no/auto (any other value falls
         # through to the auto-detect path in CMakeLists.txt).
         cuda_env = os.environ.get("LINA_USE_CUDA", "").strip().lower()
-        if cuda_env in ("1", "on", "true", "yes"):
-            cmake_args.append("-DLINA_USE_CUDA=ON")
-            print("[lina_cpp] LINA_USE_CUDA=1 set; forcing GPU build "
-                  "(will fail if no CUDA toolkit available).")
-        elif cuda_env in ("0", "off", "false", "no"):
-            cmake_args.append("-DLINA_USE_CUDA=OFF")
+        forced_cuda_on = cuda_env in ("1", "on", "true", "yes")
+        forced_cuda_off = cuda_env in ("0", "off", "false", "no")
+
+        # Pre-flight nvcc sanity check when the user forces a GPU build.
+        # Without this the build fails opaquely on the first cmake error.
+        if forced_cuda_on:
+            nvcc = shutil.which("nvcc")
+            if not nvcc:
+                raise RuntimeError(
+                    "LINA_USE_CUDA=1 set but `nvcc` is not on PATH. This is "
+                    "the most common failure mode in conda envs: cupy ships "
+                    "its own CUDA runtime libs but does not pull in nvcc or "
+                    "the dev headers. Install them with:\n\n"
+                    "    conda install -c nvidia cuda-nvcc cuda-cudart-dev "
+                    "cuda-libraries-dev\n\n"
+                    "or unset LINA_USE_CUDA to build CPU-only."
+                )
+            print(f"[lina_cpp] LINA_USE_CUDA=1 set; forcing GPU build "
+                  f"(nvcc={nvcc}).")
+        elif forced_cuda_off:
             print("[lina_cpp] LINA_USE_CUDA=0 set; forcing CPU-only build.")
         else:
             if cuda_env and cuda_env != "auto":
@@ -126,10 +140,8 @@ class CMakeBuild(build_ext):
             print("[lina_cpp] LINA_USE_CUDA not set; CMake will auto-detect "
                   "CUDA. Set LINA_USE_CUDA=1 to force GPU, =0 for CPU.")
 
-        # Allow the caller to inject extra CMake flags, e.g.
-        # LINA_CMAKE_ARGS="-DLINA_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89".
-        if extra := os.environ.get("LINA_CMAKE_ARGS"):
-            cmake_args.extend(extra.split())
+        # Extra user-supplied CMake flags (e.g. CUDA_ARCHITECTURES).
+        extra_args = (os.environ.get("LINA_CMAKE_ARGS") or "").split()
 
         build_args = ["--config", cfg, "--target", "lina_py"]
         if jobs := os.environ.get("LINA_BUILD_JOBS"):
@@ -143,16 +155,53 @@ class CMakeBuild(build_ext):
                 f"Set LINA_CPP_SOURCE_DIR to override."
             )
 
-        print(f"[lina_cpp] Configuring CMake: {CPP_SOURCE_DIR} -> {build_temp}")
-        subprocess.check_call(
-            ["cmake", str(CPP_SOURCE_DIR), *cmake_args],
-            cwd=build_temp,
-        )
-        print(f"[lina_cpp] Building extension into {ext_dir}")
-        subprocess.check_call(
-            ["cmake", "--build", str(build_temp), *build_args],
-            cwd=build_temp,
-        )
+        # Build attempts. If the user forced a setting, we make exactly one
+        # attempt. If they left it on auto, we first try whatever CMake
+        # decides (typically GPU on a CUDA box), and on failure we wipe the
+        # build dir and retry CPU-only, so partial CUDA installs degrade
+        # gracefully instead of breaking `pip install`.
+        if forced_cuda_on:
+            attempts = [("forced GPU", ["-DLINA_USE_CUDA=ON", *extra_args])]
+        elif forced_cuda_off:
+            attempts = [("forced CPU", ["-DLINA_USE_CUDA=OFF", *extra_args])]
+        else:
+            attempts = [
+                ("auto-detect", list(extra_args)),
+                ("CPU fallback", ["-DLINA_USE_CUDA=OFF", *extra_args]),
+            ]
+
+        for i, (label, attempt_args) in enumerate(attempts):
+            is_last = (i == len(attempts) - 1)
+            attempt_cmake_args = common_args + attempt_args
+
+            # Fresh build directory each attempt so a half-configured CUDA
+            # cache from a failed run doesn't poison the CPU fallback.
+            if i > 0 and build_temp.exists():
+                print(f"[lina_cpp] Wiping {build_temp} before retry.")
+                shutil.rmtree(build_temp)
+                build_temp.mkdir(parents=True, exist_ok=True)
+
+            print(f"[lina_cpp] === attempt {i+1}/{len(attempts)}: {label} ===")
+            print(f"[lina_cpp] Configuring CMake: {CPP_SOURCE_DIR} "
+                  f"-> {build_temp}")
+            try:
+                subprocess.check_call(
+                    ["cmake", str(CPP_SOURCE_DIR), *attempt_cmake_args],
+                    cwd=build_temp,
+                )
+                print(f"[lina_cpp] Building extension into {ext_dir}")
+                subprocess.check_call(
+                    ["cmake", "--build", str(build_temp), *build_args],
+                    cwd=build_temp,
+                )
+                break  # Success.
+            except subprocess.CalledProcessError as exc:
+                if is_last:
+                    print(f"[lina_cpp] {label} build failed with exit "
+                          f"{exc.returncode}; no more fallbacks.")
+                    raise
+                print(f"[lina_cpp] {label} build failed with exit "
+                      f"{exc.returncode}; retrying with CPU-only.")
 
         # CMake honours CMAKE_LIBRARY_OUTPUT_DIRECTORY for the .so, but
         # some generators put it under build/ regardless. Hunt for it.
