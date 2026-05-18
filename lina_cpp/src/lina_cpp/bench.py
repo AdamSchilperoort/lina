@@ -45,19 +45,34 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 def _detect_backends():
+    """Probe each backend. cupy detection in particular goes beyond a bare
+    `import cupy` and actually performs a tiny GPU operation, because on
+    conda environments where ``CUDA_PATH`` is not set or ``nvcc`` is not
+    on PATH, cupy's submodules ``cupy._core`` and ``cupy.cuda.compiler``
+    can import successfully but die later with cryptic errors like
+    ``AttributeError: 'NoneType' object has no attribute 'startswith'``.
+    By forcing a real cupy.array round-trip here we surface that failure
+    once at startup, with a clear hint about how to fix it.
+    """
     info = {
         "numpy": True,
         "cupy": False,
+        "cupy_error": None,
         "lina": False,
         "lina_xp_name": None,
         "lina_cpp": False,
         "lina_cpp_gpu": False,
     }
     try:
-        import cupy as cp  # noqa: F401
+        import cupy as cp
+        # Tiny round-trip: triggers JIT path, CUDA_PATH discovery, etc.
+        _probe = cp.asarray(np.array([1.0, 2.0], dtype=np.float64))
+        _ = float((_probe * 2.0).sum())
+        cp.cuda.runtime.deviceSynchronize()
         info["cupy"] = True
-    except BaseException:
-        pass
+    except BaseException as exc:
+        info["cupy_error"] = f"{type(exc).__name__}: {exc}"
+
     try:
         import lina  # noqa: F401
         from lina.math_module import xp as lina_xp
@@ -65,6 +80,7 @@ def _detect_backends():
         info["lina_xp_name"] = getattr(lina_xp, "__name__", type(lina_xp).__name__)
     except BaseException:
         pass
+
     try:
         import lina_cpp  # noqa: F401
         info["lina_cpp"] = True
@@ -72,6 +88,20 @@ def _detect_backends():
     except BaseException:
         pass
     return info
+
+
+def _lina_backends_to_time(info: dict) -> list[str]:
+    """Decide which lina backends to time given system capabilities.
+
+    * If cupy works AND lina is importable: time both 'cpu' and 'gpu',
+      so the user gets a direct numpy-vs-cupy row pair.
+    * Otherwise: just time the one backend lina has access to.
+    """
+    if not info["lina"]:
+        return []
+    if info["cupy"]:
+        return ["cpu", "gpu"]
+    return ["cpu"]
 
 
 def _cupy_sync():
@@ -136,18 +166,19 @@ def bench_fft(N: int, repeats: int, info: dict) -> dict:
         out["cupy"] = _time_call(_cp_fft, sync=_cupy_sync, repeats=repeats)
 
     if info["lina"]:
+        import lina
         import lina.props as lprops
-        from lina.math_module import xp as lina_xp
-        on_gpu = info["lina_xp_name"] == "cupy"
-        arr_lina = lina_xp.asarray(arr_np) if hasattr(lina_xp, "asarray") else arr_np
+        for backend in _lina_backends_to_time(info):
+            lina.set_backend(backend)
+            arr_lina = lina.math_module.xp.asarray(arr_np)
 
-        def _lina_fft():
-            return lprops.fft(arr_lina)
-        out["lina"] = _time_call(
-            _lina_fft,
-            sync=_cupy_sync if on_gpu else None,
-            repeats=repeats,
-        )
+            def _lina_fft():
+                return lprops.fft(arr_lina)
+            out[f"lina ({backend})"] = _time_call(
+                _lina_fft,
+                sync=_cupy_sync if backend == "gpu" else None,
+                repeats=repeats,
+            )
 
     if info["lina_cpp"]:
         import lina_cpp
@@ -210,18 +241,19 @@ def bench_mft_forward(npix: int, npsf: int, repeats: int, info: dict) -> dict:
             pass
 
     if info["lina"]:
+        import lina
         import lina.props as lprops
-        from lina.math_module import xp as lina_xp
-        on_gpu = info["lina_xp_name"] == "cupy"
-        wf_lina = lina_xp.asarray(wf_np) if hasattr(lina_xp, "asarray") else wf_np
+        for backend in _lina_backends_to_time(info):
+            lina.set_backend(backend)
+            wf_lina = lina.math_module.xp.asarray(wf_np)
 
-        def _lina_mft():
-            return lprops.mft_forward(wf_lina, npix, npsf, 0.5)
-        out["lina"] = _time_call(
-            _lina_mft,
-            sync=_cupy_sync if on_gpu else None,
-            repeats=repeats,
-        )
+            def _lina_mft():
+                return lprops.mft_forward(wf_lina, npix, npsf, 0.5)
+            out[f"lina ({backend})"] = _time_call(
+                _lina_mft,
+                sync=_cupy_sync if backend == "gpu" else None,
+                repeats=repeats,
+            )
 
     if info["lina_cpp"]:
         import lina_cpp
@@ -268,16 +300,18 @@ def bench_make_vortex(npix: int, repeats: int, info: dict) -> dict:
             pass
 
     if info["lina"]:
+        import lina
         import lina.props as lprops
-        on_gpu = info["lina_xp_name"] == "cupy"
+        for backend in _lina_backends_to_time(info):
+            lina.set_backend(backend)
 
-        def _lina_vortex():
-            return lprops.make_vortex_phase_mask(npix, charge=charge)
-        out["lina"] = _time_call(
-            _lina_vortex,
-            sync=_cupy_sync if on_gpu else None,
-            repeats=repeats,
-        )
+            def _lina_vortex():
+                return lprops.make_vortex_phase_mask(npix, charge=charge)
+            out[f"lina ({backend})"] = _time_call(
+                _lina_vortex,
+                sync=_cupy_sync if backend == "gpu" else None,
+                repeats=repeats,
+            )
 
     if info["lina_cpp"]:
         import lina_cpp
@@ -303,7 +337,15 @@ def bench_make_vortex(npix: int, repeats: int, info: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 # Stable ordering of stacks in the output table.
-STACK_ORDER = ("numpy", "cupy", "lina", "lina_cpp CPU", "lina_cpp GPU")
+STACK_ORDER = (
+    "numpy",
+    "cupy",
+    "lina (cpu)",
+    "lina (gpu)",
+    "lina",  # legacy/fallback when neither toggle nor cupy is present
+    "lina_cpp CPU",
+    "lina_cpp GPU",
+)
 
 
 def _pick_baseline(timings: dict) -> tuple[str, float]:
@@ -371,10 +413,30 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     info = _detect_backends()
 
+    # Save & restore the user's lina backend so running the bench from
+    # a notebook doesn't change their session state silently.
+    saved_lina_backend = None
+    if info["lina"]:
+        try:
+            import lina
+            saved_lina_backend = lina.get_backend()
+        except Exception:
+            pass
+
     print("lina_cpp benchmark")
     print("==================")
     print(f"  numpy             : {info['numpy']}")
     print(f"  cupy              : {info['cupy']}")
+    if not info['cupy'] and info['cupy_error']:
+        print(f"     cupy is installed but failed a tiny GPU round-trip:")
+        print(f"     -> {info['cupy_error']}")
+        print(f"     Common fixes (most likely on conda environments):")
+        print(f"       export CUDA_PATH=/usr/local/cuda")
+        print(f"       export CUDA_HOME=/usr/local/cuda")
+        print(f"       export PATH=$CUDA_PATH/bin:$PATH")
+        print(f"     ...then re-run.  If cupy was installed for a different")
+        print(f"     CUDA major version than the toolkit on disk, reinstall")
+        print(f"     with e.g. `pip install --force cupy-cuda13x`.")
     print(f"  lina              : {info['lina']}"
           + (f"  (xp={info['lina_xp_name']})" if info['lina'] else ""))
     print(f"  lina_cpp          : {info['lina_cpp']}")
@@ -397,6 +459,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         for N in args.sizes:
             t = bench_make_vortex(N, args.repeats, info)
             _print_table(f"Vortex phase mask     N = {N}", t)
+
+    if saved_lina_backend is not None:
+        try:
+            import lina
+            lina.set_backend(saved_lina_backend)
+        except Exception:
+            pass
 
     print()
     return 0

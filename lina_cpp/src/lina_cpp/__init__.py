@@ -116,6 +116,48 @@ for _name in _dispatch_names:
     _flat_names.append(_name)
 
 
+# Unified backend toggle: switch BOTH the lina Python backend (numpy/cupy)
+# AND the lina_cpp C++ device dispatcher (cpu/gpu) with one call. Handy
+# in notebooks where users want one knob for "run everything on the
+# GPU" or "run everything on the CPU".
+def set_backend(name: str) -> dict:
+    """Switch both lina (numpy/cupy) and lina_cpp (CPU/GPU) at once.
+
+    Parameters
+    ----------
+    name : {'cpu', 'gpu'}
+        Target backend for the entire stack.
+
+    Returns
+    -------
+    dict
+        ``{'lina': <new lina backend>, 'lina_cpp': <new lina_cpp device>}``.
+
+    Raises
+    ------
+    RuntimeError
+        If ``'gpu'`` is requested but either side cannot satisfy it
+        (cupy missing, or lina_cpp built without CUDA). The first side
+        that fails raises; nothing is changed on the other side.
+    """
+    n = str(name).lower()
+    if n not in ("cpu", "gpu"):
+        raise ValueError(f"backend must be 'cpu' or 'gpu', got {name!r}")
+
+    # Update lina first, so a failure there leaves lina_cpp untouched.
+    try:
+        import lina
+        lina_state = lina.set_backend(n)
+    except ImportError:
+        lina_state = None  # lina not installed; nothing to do for it.
+
+    lina_cpp_state = set_device(n)
+    return {"lina": lina_state, "lina_cpp": lina_cpp_state}
+
+
+_flat_names.append("set_backend")
+
+
 # ---------------------------------------------------------------------------
 # 3. Submodule layout: thin Python wrappers that mirror lina's modules.
 #    These re-export from lina.* for un-ported helpers and delegate
