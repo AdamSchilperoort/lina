@@ -187,14 +187,23 @@ the rebuild and you'll still see `gpu_available() == False`.
 > downgrade to glibc 2.39, or build inside an Ubuntu 22.04 container.
 > See the header note in `cpp/CMakeLists.txt`.
 
-### Troubleshooting: stale `_core.so`
+### Troubleshooting: stale or miscompiled `_core.so`
 
 `pip install -e .` does **not** always recompile the C++ extension when
 only the C++ sources change. Setuptools sees no new `.py` files and
 skips `build_ext`. CMake also reuses `lina_cpp/build/` across runs, so a
 half-built `.so` from a failed earlier attempt can stick around.
 
-The canonical symptom of a stale binary on the parity suite is
+There is also a **toolchain-specific** miscompilation observed on
+**NVIDIA Jetson (aarch64) with CUDA-enabled `-O3` builds**, where the
+host gcc/clang vectorizes hand-rolled gemv loops with NEON and
+collapses the per-row pointer increment, returning
+`[c0, c0, c0, ...]` instead of the real coefficients. The fix in
+`cpp/src/llowfsc.cpp` rewrites those loops to use the safe
+``Array2D::operator()(r, c)`` accessor, which the vectorizer cannot
+hoist; that's enough to neutralize the bug regardless of platform.
+
+The canonical symptom of either issue on the parity suite is
 `lina_cpp.llowfsc_reconstruct` returning a constant vector (every
 coefficient equal to `coeff[0]`), which then triggers a cascade of
 "constant DESIRED array" failures in
@@ -222,6 +231,21 @@ LINA_USE_CUDA=0 bash scripts/clean_rebuild_lina_cpp.sh   # force CPU
 After that script finishes the parity suite should report a clean
 `46 passed, 1 xfailed` (or similar -- the actual number of tests grows
 over time).
+
+### Troubleshooting: `test_gemv` fails on NVIDIA Jetson / aarch64
+
+If `test_gemv` reports the C++ result disagreeing with `A @ x`, your
+system OpenBLAS' `cblas_dgemv` may be miscompiled. We've seen this on
+JetPack's bundled OpenBLAS. Set `LINA_GEMV_NAIVE=1` to bypass CBLAS
+and use the hand-rolled, safely-accessored fallback (slower for large
+matrices but correct):
+
+```bash
+LINA_GEMV_NAIVE=1 python -m pytest lina/tests/test_per_method_parity.py -v
+```
+
+To make it permanent, add `export LINA_GEMV_NAIVE=1` to your shell
+init. The flag has no effect on x86-64 builds with a good OpenBLAS.
 
 ## 4b. Choosing CPU vs GPU at runtime
 

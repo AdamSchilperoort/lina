@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 #ifdef LINA_USE_OPENBLAS
@@ -68,25 +69,16 @@ Array2D<double> gemm(const Array2D<double>& a,
     return out;
 }
 
-std::vector<double> gemv(const Array2D<double>& a,
-                         const std::vector<double>& x,
-                         bool transpose_a) {
+// Internal: hand-rolled gemv via the safe Array2D accessor. Used as a
+// fallback when CBLAS is disabled or as a runtime escape hatch on
+// platforms where the system BLAS produces wrong dgemv results
+// (observed: some NVIDIA-Jetson aarch64 OpenBLAS builds).
+static std::vector<double> gemv_naive(const Array2D<double>& a,
+                                      const std::vector<double>& x,
+                                      bool transpose_a) {
     const std::size_t rows = transpose_a ? a.cols() : a.rows();
     const std::size_t cols = transpose_a ? a.rows() : a.cols();
-    if (cols != x.size()) {
-        throw std::invalid_argument("gemv dimension mismatch");
-    }
-
     std::vector<double> out(rows, 0.0);
-
-#ifdef LINA_USE_OPENBLAS
-    const CBLAS_TRANSPOSE ta = transpose_a ? CblasTrans : CblasNoTrans;
-    const int m = static_cast<int>(a.rows());
-    const int n = static_cast<int>(a.cols());
-    const int lda = static_cast<int>(a.cols());
-    cblas_dgemv(CblasRowMajor, ta, m, n, 1.0, a.data(), lda,
-                x.data(), 1, 0.0, out.data(), 1);
-#else
     for (std::size_t i = 0; i < rows; ++i) {
         double sum = 0.0;
         for (std::size_t j = 0; j < cols; ++j) {
@@ -95,9 +87,41 @@ std::vector<double> gemv(const Array2D<double>& a,
         }
         out[i] = sum;
     }
-#endif
-
     return out;
+}
+
+std::vector<double> gemv(const Array2D<double>& a,
+                         const std::vector<double>& x,
+                         bool transpose_a) {
+    const std::size_t cols = transpose_a ? a.rows() : a.cols();
+    if (cols != x.size()) {
+        throw std::invalid_argument("gemv dimension mismatch");
+    }
+
+#ifdef LINA_USE_OPENBLAS
+    // Runtime opt-out for platforms whose CBLAS dgemv is buggy. Set
+    // LINA_GEMV_NAIVE=1 in the environment to force the hand-rolled
+    // loop and bypass the system BLAS.
+    static const bool force_naive = [] {
+        const char* env = std::getenv("LINA_GEMV_NAIVE");
+        return env && env[0] && env[0] != '0';
+    }();
+    if (force_naive) {
+        return gemv_naive(a, x, transpose_a);
+    }
+
+    const std::size_t rows = transpose_a ? a.cols() : a.rows();
+    std::vector<double> out(rows, 0.0);
+    const CBLAS_TRANSPOSE ta = transpose_a ? CblasTrans : CblasNoTrans;
+    const int m = static_cast<int>(a.rows());
+    const int n = static_cast<int>(a.cols());
+    const int lda = static_cast<int>(a.cols());
+    cblas_dgemv(CblasRowMajor, ta, m, n, 1.0, a.data(), lda,
+                x.data(), 1, 0.0, out.data(), 1);
+    return out;
+#else
+    return gemv_naive(a, x, transpose_a);
+#endif
 }
 
 SvdResult svd(const Array2D<double>& a) {

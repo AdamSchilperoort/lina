@@ -98,6 +98,17 @@ def test_import() -> bool:
         [s for s in dir(lina_cpp._core) if not s.startswith("_")]
     )
     print(f"{INFO} _core exports     = {ncore_syms} symbols")
+    # Toolchain info -- useful when a miscompilation creeps in.
+    try:
+        import numpy
+        print(f"{INFO} numpy version     = {numpy.__version__}")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import pybind11  # type: ignore
+        print(f"{INFO} pybind11 version  = {pybind11.__version__}")
+    except Exception:  # noqa: BLE001
+        pass
     return _record("import lina_cpp", True)
 
 
@@ -207,16 +218,18 @@ def test_dm_mask() -> bool:
 
 
 def test_llowfsc_reconstruct_sanity() -> bool:
-    """Catch the 'stale _core.so' symptom on the user's server.
+    """Catch the 'collapsed gemv loop' miscompilation.
 
     The C++ ``llowfsc_reconstruct`` computes ``coeff[k] = C[mode_lo+k]
     @ del_im[mask]``. For random inputs each coefficient must differ.
     A binary that returns ``[c0, c0, c0, ...]`` (every entry equal to
-    coeff[0]) is the canonical signature of a stale or miscompiled
-    extension where the per-row pointer is being hoisted out of the
-    inner loop. Bail loudly with rebuild instructions when we see it.
+    coeff[0]) means the per-row pointer is being hoisted out of the
+    inner loop -- observed on gcc 12 with CUDA-enabled -O3 builds. We
+    rewrote the loop to use the safe ``Array2D::operator()(r, c)``
+    accessor specifically to dodge that miscompilation; this test
+    catches any regression that brings it back.
     """
-    _section("llowfsc_reconstruct sanity (catches stale _core.so)")
+    _section("llowfsc_reconstruct sanity (catches miscompiled gemv loop)")
     try:
         import lina_cpp
     except BaseException as exc:
@@ -246,28 +259,64 @@ def test_llowfsc_reconstruct_sanity() -> bool:
             f"expected ({Nmodes},), got {coeff.shape}",
         )
 
+    # Cross-check against the pure-Python lina, when available. If the
+    # backends disagree we dump enough state that a remote user can
+    # send the smoke output back and we can pinpoint the cause.
+    try:
+        import lina  # noqa: F401
+        from lina.llowfsc import reconstruct as py_reconstruct
+        lina.set_backend("cpu")
+        py_coeff = np.asarray(py_reconstruct(
+            camlo, ref, mask.astype(bool), C,
+            dark_im=0.0, modes=(0, Nmodes),
+            flux_norm=True, return_del_im=False,
+        ))
+        py_ref = py_coeff
+    except BaseException:
+        py_ref = None
+
     spread = float(coeff.max() - coeff.min())
     n_unique = int(np.unique(np.round(coeff, 12)).size)
     is_constant = n_unique <= 1 or spread < 1e-12
 
     if is_constant:
-        msg = (
-            f"output is constant ({coeff[0]:+.6f} x {Nmodes}). "
-            "This is the 'stale binary' bug -- the C++ source is correct "
-            "but your compiled _core.so was built from an older/buggy "
-            "intermediate state. Wipe it and reinstall:\n"
-            "    rm -rf lina_cpp/build lina_cpp/src/lina_cpp/_core*.so\n"
-            "    pip uninstall -y lina_cpp\n"
-            "    pip install -e ./lina_cpp/ --no-build-isolation "
-            "--force-reinstall --no-cache-dir"
+        msg_lines = [
+            f"C++ output is constant ({coeff[0]:+.9f} x {Nmodes}).",
+            f"  Nmask = {Nmask},  C.shape = {C.shape}",
+            f"  cpp[:5] = {coeff[:5]}",
+        ]
+        if py_ref is not None:
+            msg_lines.append(f"  py [:5] = {py_ref[:5]}  (correct reference)")
+            msg_lines.append(
+                f"  cpp[0] matches py[0]? "
+                f"{np.isclose(coeff[0], py_ref[0], rtol=1e-10)}"
+            )
+        msg_lines.append(
+            "This is the 'collapsed gemv loop' bug. The defensive fix "
+            "in cpp/src/llowfsc.cpp uses Array2D::operator()(r,c) "
+            "specifically to prevent this; if you see this message "
+            "after a clean rebuild on a recent checkout, send the "
+            "full smoke output, your compiler version (`gcc --version`),"
+            " your numpy version, and your pybind11 version "
+            "(`python -c 'import pybind11; print(pybind11.__version__)'`) "
+            "to debug."
         )
         return _record("llowfsc_reconstruct produces non-constant vector",
-                       False, msg)
+                       False, "\n        ".join(msg_lines))
 
+    # Spread looks OK -- also verify parity with Python when we have it.
+    parity_msg = f"spread = {spread:.3e}, {n_unique}/{Nmodes} distinct"
+    if py_ref is not None:
+        max_err = float(np.max(np.abs(coeff - py_ref)))
+        parity_msg += f"; max|cpp - py| = {max_err:.2e}"
+        if max_err > 1e-10:
+            return _record(
+                "llowfsc_reconstruct matches Python",
+                False, parity_msg,
+            )
     return _record(
         "llowfsc_reconstruct produces non-constant vector",
-        True,
-        f"spread = {spread:.3e}, {n_unique} distinct values out of {Nmodes}",
+        True, parity_msg,
     )
 
 

@@ -199,16 +199,24 @@ std::vector<double> reconstruct(const Array2D<double>& camlo_im,
     std::vector<double> del_masked = extract_masked(work, wfs_mask);
     std::vector<double> coeff(mode_hi - mode_lo, 0.0);
 
-    // The control matrix is row-major (Nmodes, Nmask). We do
-    //     coeff[k] = sum_j  control_matrix[mode_lo+k][j] * del_masked[j]
-    // which is gemv with stride = Nmask.
-    const double* C = control_matrix.data();
+    // The control matrix is row-major (Nmodes, Nmask). We compute
+    //     coeff[k] = sum_j  control_matrix(mode_lo+k, j) * del_masked[j]
+    // using the safe 2-D accessor instead of raw pointer arithmetic.
+    //
+    // Earlier we hand-rolled this as
+    //     const double* row = C + (mode_lo + k) * Ncol;
+    //     for (j ...) s += row[j] * del_masked[j];
+    // which on some toolchains (observed: gcc 12 in a CUDA-enabled
+    // build with -O3) miscompiles the per-row pointer increment and
+    // collapses every coeff[k] to coeff[0]. The 2-D accessor below
+    // forces the index multiply per element and is immune.
     const std::size_t Ncol = control_matrix.cols();
-    for (std::size_t k = 0; k < coeff.size(); ++k) {
-        const double* row = C + (mode_lo + k) * Ncol;
+    const std::size_t k_count = mode_hi - mode_lo;
+    for (std::size_t k = 0; k < k_count; ++k) {
+        const std::size_t k_row = mode_lo + k;
         double s = 0.0;
         for (std::size_t j = 0; j < Ncol; ++j) {
-            s += row[j] * del_masked[j];
+            s += control_matrix(k_row, j) * del_masked[j];
         }
         coeff[k] = s;
     }
@@ -249,20 +257,22 @@ Array2D<double> compute_zpo(const std::vector<std::vector<double>>& dm_commands_
         }
 
         // tmp_modes = dm_modal_matrix . dm_cmd   (Nmodes x Ndm) * (Ndm) -> (Nmodes)
-        const double* M = dm_modal_matrix.data();
+        // Use the 2-D accessor to dodge a row-pointer hoisting bug seen
+        // in some gcc + CUDA-enabled -O3 builds (see reconstruct()).
         for (std::size_t i = 0; i < Nmodes; ++i) {
-            const double* row = M + i * Ndm;
             double s = 0.0;
-            for (std::size_t j = 0; j < Ndm; ++j) s += row[j] * dm_cmd[j];
+            for (std::size_t j = 0; j < Ndm; ++j) {
+                s += dm_modal_matrix(i, j) * dm_cmd[j];
+            }
             tmp_modes[i] = s;
         }
 
         // tmp_pixels = response_matrix . tmp_modes  (Nmask x Nmodes) * (Nmodes) -> (Nmask)
-        const double* R = response_matrix.data();
         for (std::size_t i = 0; i < Nmask; ++i) {
-            const double* row = R + i * Nmodes;
             double s = 0.0;
-            for (std::size_t j = 0; j < Nmodes; ++j) s += row[j] * tmp_modes[j];
+            for (std::size_t j = 0; j < Nmodes; ++j) {
+                s += response_matrix(i, j) * tmp_modes[j];
+            }
             tmp_pixels[i] = s;
         }
 
@@ -325,15 +335,17 @@ Array2D<double> loop_step(const Array2D<double>& camlo_im,
     }
 
     // 4) del_dm_command = sum_i modal_coeff[i] * dm_modes_flat[mode_lo+i, :]
+    // 2-D accessor for the same reason as reconstruct() / compute_zpo().
     Array2D<double> del_dm(dm_rows, dm_cols, 0.0);
     const std::size_t Ndm = dm_rows * dm_cols;
-    const double* MFlat = dm_modes_flat.data();
     double* dst = del_dm.data();
     for (std::size_t i = 0; i < modal_coeff.size(); ++i) {
         const double w = modal_coeff[i];
         if (w == 0.0) continue;
-        const double* row = MFlat + (mode_lo + i) * Ndm;
-        for (std::size_t k = 0; k < Ndm; ++k) dst[k] += w * row[k];
+        const std::size_t mrow = mode_lo + i;
+        for (std::size_t k = 0; k < Ndm; ++k) {
+            dst[k] += w * dm_modes_flat(mrow, k);
+        }
     }
     return del_dm;
 }
