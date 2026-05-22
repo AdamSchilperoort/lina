@@ -5,6 +5,7 @@ import time
 import unittest
 
 import numpy as np
+from lina.tests.lina_cpp_test_utils import import_lina_cpp_or_skip
 
 
 REPORT_PATH = os.environ.get(
@@ -15,9 +16,11 @@ REPORT_PATH = os.environ.get(
 
 def _find_runner():
     candidates = [
+        os.environ.get("LINA_CPP_RUNNER"),
+        os.path.join(os.getcwd(), "cpp", "build-native", "lina_runner"),
         os.path.join(os.getcwd(), "cpp", "build", "lina_runner"),
         os.path.join(os.getcwd(), "cpp", "build-cuda", "lina_runner"),
-        os.environ.get("LINA_CPP_RUNNER"),
+        os.path.join(os.getcwd(), "cpp", "install", "bin", "lina_runner"),
     ]
     for path in candidates:
         if path and os.path.exists(path):
@@ -47,12 +50,22 @@ def _parse_bench_ms(line, prefix):
     return None
 
 
+def _avg_ms(fn, iters, warmup=2):
+    for _ in range(warmup):
+        fn()
+    start = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    return (time.perf_counter() - start) * 1000.0 / max(1, iters)
+
+
 class TestBenchmarks(unittest.TestCase):
     report_rows = []
     fft_rows = []
     svd_rows = []
     has_lina_cpp = False
     lina_cpp = None
+    cupy_error = None
 
     @classmethod
     def _record(cls, section, size_label, cpp_ms, py_ms, pybind_ms):
@@ -136,15 +149,26 @@ class TestBenchmarks(unittest.TestCase):
         if os.environ.get("LINA_RUN_BENCHMARKS") != "1":
             raise unittest.SkipTest("Benchmarks disabled (set LINA_RUN_BENCHMARKS=1)")
         try:
-            import lina_cpp
+            lina_cpp = import_lina_cpp_or_skip()
             cls.has_lina_cpp = True
             cls.lina_cpp = lina_cpp
+        except unittest.SkipTest:
+            cls.has_lina_cpp = False
         except Exception:
             cls.has_lina_cpp = False
         try:
             import cupy as cp
             cls.cupy = cp
             cls.has_cupy = True
+            # CuPy can import even when the local NVRTC/GPU arch combo is
+            # unusable. Probe a tiny op so benchmark tests can degrade
+            # gracefully instead of failing mid-run.
+            try:
+                x = cp.asarray([1.0], dtype=cp.float32)
+                _ = (x + 1.0).get()
+            except Exception as exc:
+                cls.has_cupy = False
+                cls.cupy_error = exc
         except Exception:
             cls.cupy = None
             cls.has_cupy = False
@@ -154,8 +178,18 @@ class TestBenchmarks(unittest.TestCase):
         cls.lina_props = lina_props
 
     def test_fft_benchmark(self):
-        sizes = [16, 32, 64, 128, 256, 512, 1024]
-        iters_map = {16: 10, 32: 10, 64: 10, 128: 10, 256: 10, 512: 5, 1024: 3}
+        sizes = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+        iters_map = {
+            16: 10,
+            32: 10,
+            64: 10,
+            128: 10,
+            256: 10,
+            512: 5,
+            1024: 3,
+            2048: 1,
+            4096: 1,
+        }
         for n in sizes:
             iters = iters_map[n]
             rng = np.random.default_rng(1234 + n)
@@ -183,49 +217,78 @@ class TestBenchmarks(unittest.TestCase):
             )
             self.assertTrue(out_gpu.startswith("BENCH_FFT_GPU"))
             print(out_gpu)
+            out_gpu_kernel = _run_runner(
+                "bench_fft_gpu_kernel",
+                env={
+                    "LINA_BENCH_FFT_N": str(n),
+                    "LINA_BENCH_FFT_ITERS": str(iters),
+                    "LINA_BENCH_DATA_PATH": data_path,
+                },
+            )
+            self.assertTrue(out_gpu_kernel.startswith("BENCH_FFT_GPU_KERNEL"))
+            print(out_gpu_kernel)
+            out_gpu_xfer = _run_runner(
+                "bench_fft_gpu_xfer",
+                env={
+                    "LINA_BENCH_FFT_N": str(n),
+                    "LINA_BENCH_FFT_ITERS": str(iters),
+                    "LINA_BENCH_DATA_PATH": data_path,
+                },
+            )
+            self.assertTrue(out_gpu_xfer.startswith("BENCH_FFT_GPU_XFER"))
+            print(out_gpu_xfer)
             self.math_module.update_np(np)
-            for _ in range(2):
-                _ = self.lina_props.fft(arr)
-            start = time.perf_counter()
-            for _ in range(iters):
-                _ = self.lina_props.fft(arr)
-            elapsed = (time.perf_counter() - start) * 1000.0
-            avg_ms = elapsed / iters
+            avg_ms = _avg_ms(lambda: self.lina_props.fft(arr), iters)
             print(f"PY_BENCH_FFT {n} {iters} {avg_ms:.3f}")
             pybind_cpu = None
             pybind_gpu = None
             if self.has_lina_cpp:
-                for _ in range(2):
-                    _ = self.lina_cpp.fft_cpu(arr)
-                start = time.perf_counter()
-                for _ in range(iters):
-                    _ = self.lina_cpp.fft_cpu(arr)
-                pybind_cpu = (time.perf_counter() - start) * 1000.0 / iters
-                for _ in range(2):
-                    _ = self.lina_cpp.fft_gpu(arr)
-                start = time.perf_counter()
-                for _ in range(iters):
-                    _ = self.lina_cpp.fft_gpu(arr)
-                pybind_gpu = (time.perf_counter() - start) * 1000.0 / iters
+                pybind_cpu = _avg_ms(lambda: self.lina_cpp.fft_cpu(arr), iters)
+                pybind_gpu = _avg_ms(lambda: self.lina_cpp.fft_gpu(arr), iters)
 
             cpp_ms_cpu = _parse_bench_ms(out_cpu, "BENCH_FFT_CPU")
             if cpp_ms_cpu is not None:
                 self._record("FFT-CPU", f"{n}x{n}", cpp_ms_cpu, avg_ms, pybind_cpu)
             cpp_ms_gpu = _parse_bench_ms(out_gpu, "BENCH_FFT_GPU")
-            py_gpu_ms = None
+            py_gpu_kernel_ms = None
+            py_gpu_xfer_ms = None
+            py_gpu_e2e_ms = None
             if self.has_cupy:
-                self.math_module.update_np(self.cupy)
-                arr_gpu = self.cupy.asarray(arr)
-                for _ in range(2):
-                    _ = self.lina_props.fft(arr_gpu)
-                self.cupy.cuda.Stream.null.synchronize()
-                start = time.perf_counter()
-                for _ in range(iters):
-                    _ = self.lina_props.fft(arr_gpu)
-                self.cupy.cuda.Stream.null.synchronize()
-                py_gpu_ms = (time.perf_counter() - start) * 1000.0 / iters
+                try:
+                    self.math_module.update_np(self.cupy)
+                    arr_gpu = self.cupy.asarray(arr)
+                    def _fft_xfer_only():
+                        tmp = self.cupy.asarray(arr)
+                        _ = tmp.get()
+                        self.cupy.cuda.Stream.null.synchronize()
+                    py_gpu_kernel_ms = _avg_ms(
+                        lambda: (self.lina_props.fft(arr_gpu), self.cupy.cuda.Stream.null.synchronize()),
+                        iters,
+                    )
+                    py_gpu_xfer_ms = _avg_ms(_fft_xfer_only, iters)
+                    py_gpu_e2e_ms = _avg_ms(
+                        lambda: (
+                            self.lina_props.fft(self.cupy.asarray(arr)).get(),
+                            self.cupy.cuda.Stream.null.synchronize(),
+                        ),
+                        iters,
+                    )
+                except Exception:
+                    py_gpu_kernel_ms = None
+                    py_gpu_xfer_ms = None
+                    py_gpu_e2e_ms = None
             if cpp_ms_gpu is not None:
-                self._record("FFT-GPU", f"{n}x{n}", cpp_ms_gpu, py_gpu_ms, pybind_gpu)
+                self._record("FFT-GPU", f"{n}x{n}", cpp_ms_gpu, py_gpu_e2e_ms, pybind_gpu)
+            cpp_ms_gpu_kernel = _parse_bench_ms(out_gpu_kernel, "BENCH_FFT_GPU_KERNEL")
+            cpp_ms_gpu_xfer = _parse_bench_ms(out_gpu_xfer, "BENCH_FFT_GPU_XFER")
+            if py_gpu_kernel_ms is not None:
+                pybind_kernel_est = None
+                if pybind_gpu is not None and py_gpu_xfer_ms is not None:
+                    pybind_kernel_est = max(0.0, pybind_gpu - py_gpu_xfer_ms)
+                self._record("FFT-GPU-KERNEL", f"{n}x{n}", cpp_ms_gpu_kernel, py_gpu_kernel_ms, pybind_kernel_est)
+            if py_gpu_xfer_ms is not None:
+                # Transfer proxy applies to both Python/CuPy and pybind host-array APIs.
+                self._record("FFT-GPU-XFER", f"{n}x{n}", cpp_ms_gpu_xfer, py_gpu_xfer_ms, py_gpu_xfer_ms)
             os.unlink(data_path)
 
     def test_svd_benchmark(self):
@@ -259,47 +322,77 @@ class TestBenchmarks(unittest.TestCase):
             )
             self.assertTrue(out_gpu.startswith("BENCH_SVD_SIZE_GPU"))
             print(out_gpu)
-            for _ in range(2):
-                np.linalg.svd(mat, full_matrices=True)
-            start = time.perf_counter()
-            for _ in range(iters):
-                np.linalg.svd(mat, full_matrices=True)
-            elapsed = (time.perf_counter() - start) * 1000.0
-            avg_ms = elapsed / iters
+            out_gpu_kernel = _run_runner(
+                "bench_svd_size_gpu_kernel",
+                env={
+                    "LINA_BENCH_SVD_M": str(m),
+                    "LINA_BENCH_SVD_N": str(n),
+                    "LINA_BENCH_SVD_ITERS": str(iters),
+                    "LINA_BENCH_DATA_PATH": data_path,
+                },
+            )
+            self.assertTrue(out_gpu_kernel.startswith("BENCH_SVD_SIZE_GPU_KERNEL"))
+            print(out_gpu_kernel)
+            out_gpu_xfer = _run_runner(
+                "bench_svd_size_gpu_xfer",
+                env={
+                    "LINA_BENCH_SVD_M": str(m),
+                    "LINA_BENCH_SVD_N": str(n),
+                    "LINA_BENCH_SVD_ITERS": str(iters),
+                    "LINA_BENCH_DATA_PATH": data_path,
+                },
+            )
+            self.assertTrue(out_gpu_xfer.startswith("BENCH_SVD_SIZE_GPU_XFER"))
+            print(out_gpu_xfer)
+            avg_ms = _avg_ms(lambda: np.linalg.svd(mat, full_matrices=True), iters)
             print(f"PY_BENCH_SVD_SIZE {m} {n} {avg_ms:.3f}")
             pybind_cpu = None
             pybind_gpu = None
             if self.has_lina_cpp:
-                for _ in range(2):
-                    _ = self.lina_cpp.svd_float_cpu(mat)
-                start = time.perf_counter()
-                for _ in range(iters):
-                    _ = self.lina_cpp.svd_float_cpu(mat)
-                pybind_cpu = (time.perf_counter() - start) * 1000.0 / iters
-                for _ in range(2):
-                    _ = self.lina_cpp.svd_float_gpu(mat)
-                start = time.perf_counter()
-                for _ in range(iters):
-                    _ = self.lina_cpp.svd_float_gpu(mat)
-                pybind_gpu = (time.perf_counter() - start) * 1000.0 / iters
+                pybind_cpu = _avg_ms(lambda: self.lina_cpp.svd_float_cpu(mat), iters)
+                pybind_gpu = _avg_ms(lambda: self.lina_cpp.svd_float_gpu(mat), iters)
 
             cpp_ms_cpu = _parse_bench_ms(out_cpu, "BENCH_SVD_SIZE_CPU")
             if cpp_ms_cpu is not None:
                 self._record("SVD-CPU", f"{m}x{n}", cpp_ms_cpu, avg_ms, pybind_cpu)
             cpp_ms_gpu = _parse_bench_ms(out_gpu, "BENCH_SVD_SIZE_GPU")
-            py_gpu_ms = None
+            py_gpu_kernel_ms = None
+            py_gpu_xfer_ms = None
+            py_gpu_e2e_ms = None
             if self.has_cupy:
-                mat_gpu = self.cupy.asarray(mat)
-                for _ in range(2):
-                    _ = self.cupy.linalg.svd(mat_gpu, full_matrices=True)
-                self.cupy.cuda.Stream.null.synchronize()
-                start = time.perf_counter()
-                for _ in range(iters):
-                    _ = self.cupy.linalg.svd(mat_gpu, full_matrices=True)
-                self.cupy.cuda.Stream.null.synchronize()
-                py_gpu_ms = (time.perf_counter() - start) * 1000.0 / iters
+                try:
+                    mat_gpu = self.cupy.asarray(mat)
+                    def _svd_xfer_only():
+                        tmp = self.cupy.asarray(mat)
+                        _ = tmp.get()
+                        self.cupy.cuda.Stream.null.synchronize()
+                    py_gpu_kernel_ms = _avg_ms(
+                        lambda: (self.cupy.linalg.svd(mat_gpu, full_matrices=True), self.cupy.cuda.Stream.null.synchronize()),
+                        iters,
+                    )
+                    py_gpu_xfer_ms = _avg_ms(_svd_xfer_only, iters)
+                    py_gpu_e2e_ms = _avg_ms(
+                        lambda: (
+                            tuple(t.get() for t in self.cupy.linalg.svd(self.cupy.asarray(mat), full_matrices=True)),
+                            self.cupy.cuda.Stream.null.synchronize(),
+                        ),
+                        iters,
+                    )
+                except Exception:
+                    py_gpu_kernel_ms = None
+                    py_gpu_xfer_ms = None
+                    py_gpu_e2e_ms = None
             if cpp_ms_gpu is not None:
-                self._record("SVD-GPU", f"{m}x{n}", cpp_ms_gpu, py_gpu_ms, pybind_gpu)
+                self._record("SVD-GPU", f"{m}x{n}", cpp_ms_gpu, py_gpu_e2e_ms, pybind_gpu)
+            cpp_ms_gpu_kernel = _parse_bench_ms(out_gpu_kernel, "BENCH_SVD_SIZE_GPU_KERNEL")
+            cpp_ms_gpu_xfer = _parse_bench_ms(out_gpu_xfer, "BENCH_SVD_SIZE_GPU_XFER")
+            if py_gpu_kernel_ms is not None:
+                pybind_kernel_est = None
+                if pybind_gpu is not None and py_gpu_xfer_ms is not None:
+                    pybind_kernel_est = max(0.0, pybind_gpu - py_gpu_xfer_ms)
+                self._record("SVD-GPU-KERNEL", f"{m}x{n}", cpp_ms_gpu_kernel, py_gpu_kernel_ms, pybind_kernel_est)
+            if py_gpu_xfer_ms is not None:
+                self._record("SVD-GPU-XFER", f"{m}x{n}", cpp_ms_gpu_xfer, py_gpu_xfer_ms, py_gpu_xfer_ms)
             os.unlink(data_path)
 
     def test_svd_large_benchmark(self):

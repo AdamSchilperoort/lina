@@ -805,6 +805,10 @@ PYBIND11_MODULE(LINA_PYBIND_MODULE_NAME, m) {
     m.def("svd_float_gpu", &svd_float_gpu_wrapper, py::arg("a"),
           "SVD (float, GPU/cuSOLVER)");
 #endif
+    m.def("set_num_threads", &lina::set_num_threads, py::arg("nthreads"),
+          "Set CPU math thread count (OpenBLAS / OpenMP when enabled).");
+    m.def("get_num_threads", &lina::get_num_threads,
+          "Get current CPU math thread count.");
 
     // Coronagraph utilities
     m.def("normalize_coro_im", &normalize_coro_im_wrapper,

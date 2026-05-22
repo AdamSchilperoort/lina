@@ -90,4 +90,8 @@ Array2D<std::complex<double>> get_fresnel_TF_gpu(double dz,
                                                  double wavelength,
                                                  double fnum);
 
+double benchmark_fft_gpu_e2e_ms(const Array2D<std::complex<double>>& arr, int iters);
+double benchmark_fft_gpu_kernel_ms(const Array2D<std::complex<double>>& arr, int iters);
+double benchmark_fft_gpu_xfer_ms(const Array2D<std::complex<double>>& arr, int iters);
+
 } // namespace lina

@@ -25,12 +25,17 @@ audit (see cpp/AUDIT.md).
 """
 import math
 import os
+import pathlib
 import sys
 import unittest
 
 import numpy as np
 import scipy
 import scipy.linalg
+from lina.tests.lina_cpp_test_utils import (
+    bootstrap_lina_cpp_import,
+    import_lina_cpp_or_skip,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +44,7 @@ import scipy.linalg
 
 
 def _try_import_lina_cpp():
+    bootstrap_lina_cpp_import()
     try:
         import lina_cpp  # noqa: F401
         return True
@@ -65,7 +71,7 @@ def _to_np(arr):
 def _has_lina_cpp_attr(name: str) -> bool:
     """True iff this lina_cpp build exposes the named binding."""
     try:
-        import lina_cpp
+        lina_cpp = import_lina_cpp_or_skip()
         return hasattr(lina_cpp, name)
     except Exception:
         return False
@@ -829,6 +835,252 @@ class TestLlowfsc(_LinaCppTest):
 
         np.testing.assert_allclose(_to_np(cpp_del_dm), py_del_dm,
                                     rtol=1e-10, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# efc / iefc / aefc wrappers
+# ---------------------------------------------------------------------------
+
+
+class TestControlLoopWrappers(_LinaCppTest):
+    """Parity checks for algorithm-level wrappers.
+
+    Today lina_cpp.efc / lina_cpp.iefc / lina_cpp.aefc expose Python control
+    loops (with C++ math kernels underneath where available). These tests lock
+    in same-input -> same-output behavior against lina.*.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import importlib
+        import lina_cpp
+        # When tests run against a raw CMake pybind module (lina_cpp.so),
+        # submodules like lina_cpp.efc are unavailable because lina_cpp is
+        # not a package in that mode.
+        if not hasattr(lina_cpp, "__path__"):
+            repo_root = pathlib.Path(__file__).resolve().parents[2]
+            src_dir = repo_root / "lina_cpp" / "src"
+            if src_dir.is_dir():
+                src_str = str(src_dir)
+                if src_str not in sys.path:
+                    sys.path.insert(0, src_str)
+                sys.modules.pop("lina_cpp", None)
+                try:
+                    lina_cpp = importlib.import_module("lina_cpp")
+                except Exception:
+                    pass
+        if not hasattr(lina_cpp, "__path__"):
+            raise unittest.SkipTest(
+                "control-loop wrapper parity requires the Python package "
+                "layout (pip install -e ./lina_cpp), not a standalone "
+                "lina_cpp.so pybind module"
+            )
+
+    def _dummy_dm_state(self):
+        return {"cmd": np.zeros((2, 2), dtype=np.float64)}
+
+    @staticmethod
+    def _set_dm(state, cmd):
+        state["cmd"] = np.asarray(cmd, dtype=np.float64).copy()
+
+    @staticmethod
+    def _take_im(state):
+        base = np.ones((4, 4), dtype=np.float64)
+        return base + 0.1 * float(np.sum(state["cmd"]))
+
+    @staticmethod
+    def _estimate_ef():
+        e = np.zeros((4, 4), dtype=np.complex128)
+        e[1, 1] = 1.0 + 2.0j
+        e[1, 2] = -0.5 + 0.25j
+        return e
+
+    def test_efc_run_matches_python(self):
+        import lina.efc as py_efc
+        import lina_cpp.efc as cpp_efc
+        from lina import utils
+
+        utils.imshow = lambda *_a, **_k: None
+        wfs_mask = np.zeros((4, 4), dtype=bool)
+        wfs_mask[1, 1] = True
+        wfs_mask[1, 2] = True
+        dm_mask = np.ones((2, 2), dtype=bool)
+        control_matrix = np.eye(4)
+
+        py_data = py_efc.init_data()
+        cpp_data = cpp_efc.init_data()
+
+        py_state = self._dummy_dm_state()
+        py_efc.run(
+            py_data,
+            take_im_fun=lambda: self._take_im(py_state),
+            take_im_params={},
+            set_dm_fun=lambda cmd: self._set_dm(py_state, cmd),
+            set_dm_params={},
+            estimate_ef_fun=self._estimate_ef,
+            estimate_ef_params={},
+            wfs_mask=wfs_mask,
+            dm_mask=dm_mask,
+            control_matrix=control_matrix,
+            num_iterations=1,
+            plot_current=False,
+            plot_all=False,
+        )
+
+        cpp_state = self._dummy_dm_state()
+        cpp_efc.run(
+            cpp_data,
+            take_im_fun=lambda: self._take_im(cpp_state),
+            take_im_params={},
+            set_dm_fun=lambda cmd: self._set_dm(cpp_state, cmd),
+            set_dm_params={},
+            estimate_ef_fun=self._estimate_ef,
+            estimate_ef_params={},
+            wfs_mask=wfs_mask,
+            dm_mask=dm_mask,
+            control_matrix=control_matrix,
+            num_iterations=1,
+            plot_current=False,
+            plot_all=False,
+        )
+
+        np.testing.assert_allclose(cpp_data["commands"][0], py_data["commands"][0], atol=1e-12)
+        np.testing.assert_allclose(cpp_data["del_commands"][0], py_data["del_commands"][0], atol=1e-12)
+        np.testing.assert_allclose(cpp_data["efields"][0], py_data["efields"][0], atol=1e-12)
+        self.assertAlmostEqual(float(cpp_data["contrasts"][0]), float(py_data["contrasts"][0]), places=12)
+
+    def test_iefc_run_matches_python(self):
+        import lina.iefc as py_iefc
+        import lina_cpp.iefc as cpp_iefc
+        from lina import utils
+
+        utils.imshow = lambda *_a, **_k: None
+        wfs_mask = np.zeros((4, 4), dtype=bool)
+        wfs_mask[1, 1] = True
+        wfs_mask[1, 2] = True
+
+        probe_modes = np.zeros((2, 2, 2), dtype=np.float64)
+        probe_modes[0, 0, 0] = 1.0
+        probe_modes[1, 1, 1] = -1.0
+        calib_modes = np.zeros((4, 2, 2), dtype=np.float64)
+        for i in range(4):
+            calib_modes[i].flat[i] = 1.0
+        control_matrix = np.eye(4)
+
+        py_data = py_iefc.init_data()
+        cpp_data = cpp_iefc.init_data()
+
+        py_state = self._dummy_dm_state()
+        py_iefc.run(
+            py_data,
+            take_im_fun=lambda: self._take_im(py_state),
+            take_im_params={},
+            set_dm_fun=lambda cmd: self._set_dm(py_state, cmd),
+            set_dm_params={},
+            control_matrix=control_matrix,
+            probe_modes=probe_modes,
+            probe_amplitude=0.5,
+            calib_modes=calib_modes,
+            wfs_mask=wfs_mask,
+            num_iterations=1,
+            gain=0.75,
+            leakage=0.0,
+            plot_current=False,
+            plot_all=False,
+            verbose=False,
+        )
+
+        cpp_state = self._dummy_dm_state()
+        cpp_iefc.run(
+            cpp_data,
+            take_im_fun=lambda: self._take_im(cpp_state),
+            take_im_params={},
+            set_dm_fun=lambda cmd: self._set_dm(cpp_state, cmd),
+            set_dm_params={},
+            control_matrix=control_matrix,
+            probe_modes=probe_modes,
+            probe_amplitude=0.5,
+            calib_modes=calib_modes,
+            wfs_mask=wfs_mask,
+            num_iterations=1,
+            gain=0.75,
+            leakage=0.0,
+            plot_current=False,
+            plot_all=False,
+            verbose=False,
+        )
+
+        np.testing.assert_allclose(cpp_data["commands"][0], py_data["commands"][0], atol=1e-12)
+        np.testing.assert_allclose(cpp_data["del_commands"][0], py_data["del_commands"][0], atol=1e-12)
+        self.assertAlmostEqual(float(cpp_data["contrasts"][0]), float(py_data["contrasts"][0]), places=12)
+
+    def test_aefc_run_matches_python(self):
+        import lina.aefc as py_aefc
+        import lina_cpp.aefc as cpp_aefc
+        from lina import utils
+
+        utils.imshow = lambda *_a, **_k: None
+        wfs_mask = np.zeros((4, 4), dtype=bool)
+        wfs_mask[1, 1] = True
+        wfs_mask[1, 2] = True
+        dm_mask = np.ones((2, 2), dtype=bool)
+
+        class DummyModel:
+            Nacts = 4
+            wavelength_c = 1.0
+
+            @staticmethod
+            def forward(_acts, *_args, **_kwargs):
+                return np.zeros((4, 4), dtype=np.complex128)
+
+        def val_and_grad(x, _M, _vars, *_args):
+            v = float(np.dot(x, x))
+            return v, 2.0 * x
+
+        py_data = py_aefc.init_data()
+        cpp_data = cpp_aefc.init_data()
+
+        py_state = self._dummy_dm_state()
+        py_aefc.run(
+            py_data,
+            take_im_fun=lambda: self._take_im(py_state),
+            take_im_params={},
+            set_dm_fun=lambda cmd: self._set_dm(py_state, cmd),
+            set_dm_params={},
+            estimate_ef_fun=self._estimate_ef,
+            estimate_ef_params={},
+            M=DummyModel(),
+            val_and_grad=val_and_grad,
+            wfs_mask=wfs_mask,
+            dm_mask=dm_mask,
+            num_iterations=1,
+            plot_current=False,
+            plot_all=False,
+        )
+
+        cpp_state = self._dummy_dm_state()
+        cpp_aefc.run(
+            cpp_data,
+            take_im_fun=lambda: self._take_im(cpp_state),
+            take_im_params={},
+            set_dm_fun=lambda cmd: self._set_dm(cpp_state, cmd),
+            set_dm_params={},
+            estimate_ef_fun=self._estimate_ef,
+            estimate_ef_params={},
+            M=DummyModel(),
+            val_and_grad=val_and_grad,
+            wfs_mask=wfs_mask,
+            dm_mask=dm_mask,
+            num_iterations=1,
+            plot_current=False,
+            plot_all=False,
+        )
+
+        np.testing.assert_allclose(cpp_data["commands"][0], py_data["commands"][0], atol=1e-12)
+        np.testing.assert_allclose(cpp_data["del_commands"][0], py_data["del_commands"][0], atol=1e-12)
+        np.testing.assert_allclose(cpp_data["efields"][0], py_data["efields"][0], atol=1e-12)
+        self.assertAlmostEqual(float(cpp_data["contrasts"][0]), float(py_data["contrasts"][0]), places=12)
 
 
 # ---------------------------------------------------------------------------

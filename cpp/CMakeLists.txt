@@ -166,12 +166,17 @@ if(LINA_USE_FFTW)
 endif()
 
 if(LINA_USE_OPENBLAS)
+    set(_LINA_CONDA_PREFIX $ENV{CONDA_PREFIX})
     find_path(OPENBLAS_INCLUDE_DIR cblas.h
               HINTS
+              ${_LINA_CONDA_PREFIX}
+              ${_LINA_CONDA_PREFIX}/include
               ${MAGAOX_VENDOR_ROOT}/OpenBLAS
               ${MAGAOX_VENDOR_ROOT}/OpenBLAS/include)
     find_library(OPENBLAS_LIBRARY openblas
                  HINTS
+                 ${_LINA_CONDA_PREFIX}
+                 ${_LINA_CONDA_PREFIX}/lib
                  ${MAGAOX_VENDOR_ROOT}/OpenBLAS
                  ${MAGAOX_VENDOR_ROOT}/OpenBLAS/lib)
     if(OPENBLAS_INCLUDE_DIR AND OPENBLAS_LIBRARY)
@@ -186,8 +191,11 @@ if(LINA_USE_OPENBLAS)
 endif()
 
 if(LINA_USE_LAPACKE)
+    set(_LINA_CONDA_PREFIX $ENV{CONDA_PREFIX})
     find_path(LAPACKE_INCLUDE_DIR lapacke.h
               HINTS
+              ${_LINA_CONDA_PREFIX}
+              ${_LINA_CONDA_PREFIX}/include
               ${MAGAOX_VENDOR_ROOT}/OpenBLAS
               ${MAGAOX_VENDOR_ROOT}/OpenBLAS/include
               ${MAGAOX_VENDOR_ROOT}/OpenBLAS-0.3.24/lapack-netlib/LAPACKE/include
@@ -195,6 +203,8 @@ if(LINA_USE_LAPACKE)
               ${MAGAOX_VENDOR_ROOT}/lapacke/include)
     find_library(LAPACKE_LIBRARY lapacke
                  HINTS
+                 ${_LINA_CONDA_PREFIX}
+                 ${_LINA_CONDA_PREFIX}/lib
                  ${MAGAOX_VENDOR_ROOT}/OpenBLAS
                  ${MAGAOX_VENDOR_ROOT}/OpenBLAS/lib
                  ${MAGAOX_VENDOR_ROOT}/lapacke

@@ -312,7 +312,7 @@ void print_bench(const std::string& name, int iters, Fn fn) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: lina_runner <fft|svd|efc|iefc|shmim>\n";
+        std::cerr << "Usage: lina_runner <fft|svd|efc|iefc|shmim|bench_svd_autocal>\n";
         return 1;
     }
     const std::string cmd = argv[1];
@@ -371,6 +371,51 @@ int main(int argc, char** argv) {
         std::cerr << "bench_fft_gpu requires LINA_USE_CUDA=ON\n";
         return 1;
 #endif
+    } else if (cmd == "bench_fft_gpu_kernel") {
+#ifdef LINA_USE_CUDA
+        const char* n_env = std::getenv("LINA_BENCH_FFT_N");
+        const char* it_env = std::getenv("LINA_BENCH_FFT_ITERS");
+        const char* data_env = std::getenv("LINA_BENCH_DATA_PATH");
+        const std::size_t n = n_env ? static_cast<std::size_t>(std::stoul(n_env)) : 4;
+        const int iters = it_env ? std::stoi(it_env) : 200;
+        const std::string data_path = data_env ? data_env : "";
+        const auto input = build_fft_input(n, data_path);
+        const double avg_ms = lina::benchmark_fft_gpu_kernel_ms(input, iters);
+        std::cout << "BENCH_FFT_GPU_KERNEL " << n << " " << iters << " " << avg_ms << "\n";
+#else
+        std::cerr << "bench_fft_gpu_kernel requires LINA_USE_CUDA=ON\n";
+        return 1;
+#endif
+    } else if (cmd == "bench_fft_gpu_xfer") {
+#ifdef LINA_USE_CUDA
+        const char* n_env = std::getenv("LINA_BENCH_FFT_N");
+        const char* it_env = std::getenv("LINA_BENCH_FFT_ITERS");
+        const char* data_env = std::getenv("LINA_BENCH_DATA_PATH");
+        const std::size_t n = n_env ? static_cast<std::size_t>(std::stoul(n_env)) : 4;
+        const int iters = it_env ? std::stoi(it_env) : 200;
+        const std::string data_path = data_env ? data_env : "";
+        const auto input = build_fft_input(n, data_path);
+        const double avg_ms = lina::benchmark_fft_gpu_xfer_ms(input, iters);
+        std::cout << "BENCH_FFT_GPU_XFER " << n << " " << iters << " " << avg_ms << "\n";
+#else
+        std::cerr << "bench_fft_gpu_xfer requires LINA_USE_CUDA=ON\n";
+        return 1;
+#endif
+    } else if (cmd == "bench_fft_gpu_e2e") {
+#ifdef LINA_USE_CUDA
+        const char* n_env = std::getenv("LINA_BENCH_FFT_N");
+        const char* it_env = std::getenv("LINA_BENCH_FFT_ITERS");
+        const char* data_env = std::getenv("LINA_BENCH_DATA_PATH");
+        const std::size_t n = n_env ? static_cast<std::size_t>(std::stoul(n_env)) : 4;
+        const int iters = it_env ? std::stoi(it_env) : 200;
+        const std::string data_path = data_env ? data_env : "";
+        const auto input = build_fft_input(n, data_path);
+        const double avg_ms = lina::benchmark_fft_gpu_e2e_ms(input, iters);
+        std::cout << "BENCH_FFT_GPU_E2E " << n << " " << iters << " " << avg_ms << "\n";
+#else
+        std::cerr << "bench_fft_gpu_e2e requires LINA_USE_CUDA=ON\n";
+        return 1;
+#endif
     } else if (cmd == "bench_svd") {
         print_bench("BENCH_SVD", 200, [] { compute_svd_float(); });
     } else if (cmd == "bench_svd_size") {
@@ -421,6 +466,73 @@ int main(int argc, char** argv) {
                     iters, [&input] { lina::svd_float_gpu(input); });
 #else
         std::cerr << "bench_svd_size_gpu requires LINA_USE_CUDA=ON\n";
+        return 1;
+#endif
+    } else if (cmd == "bench_svd_size_gpu_kernel") {
+#ifdef LINA_USE_CUDA
+        const char* m_env = std::getenv("LINA_BENCH_SVD_M");
+        const char* n_env = std::getenv("LINA_BENCH_SVD_N");
+        const char* it_env = std::getenv("LINA_BENCH_SVD_ITERS");
+        const char* data_env = std::getenv("LINA_BENCH_DATA_PATH");
+        const std::size_t m = m_env ? static_cast<std::size_t>(std::stoul(m_env)) : 5000;
+        const std::size_t n = n_env ? static_cast<std::size_t>(std::stoul(n_env)) : 2000;
+        const int iters = it_env ? std::stoi(it_env) : 1;
+        const std::string data_path = data_env ? data_env : "";
+        const auto input = build_svd_input(m, n, data_path);
+        const double avg_ms = lina::benchmark_svd_float_gpu_kernel_ms(input, iters);
+        std::cout << "BENCH_SVD_SIZE_GPU_KERNEL " << m << " " << n << " " << iters << " " << avg_ms << "\n";
+#else
+        std::cerr << "bench_svd_size_gpu_kernel requires LINA_USE_CUDA=ON\n";
+        return 1;
+#endif
+    } else if (cmd == "bench_svd_size_gpu_xfer") {
+#ifdef LINA_USE_CUDA
+        const char* m_env = std::getenv("LINA_BENCH_SVD_M");
+        const char* n_env = std::getenv("LINA_BENCH_SVD_N");
+        const char* it_env = std::getenv("LINA_BENCH_SVD_ITERS");
+        const char* data_env = std::getenv("LINA_BENCH_DATA_PATH");
+        const std::size_t m = m_env ? static_cast<std::size_t>(std::stoul(m_env)) : 5000;
+        const std::size_t n = n_env ? static_cast<std::size_t>(std::stoul(n_env)) : 2000;
+        const int iters = it_env ? std::stoi(it_env) : 1;
+        const std::string data_path = data_env ? data_env : "";
+        const auto input = build_svd_input(m, n, data_path);
+        const double avg_ms = lina::benchmark_svd_float_gpu_xfer_ms(input, iters);
+        std::cout << "BENCH_SVD_SIZE_GPU_XFER " << m << " " << n << " " << iters << " " << avg_ms << "\n";
+#else
+        std::cerr << "bench_svd_size_gpu_xfer requires LINA_USE_CUDA=ON\n";
+        return 1;
+#endif
+    } else if (cmd == "bench_svd_size_gpu_e2e") {
+#ifdef LINA_USE_CUDA
+        const char* m_env = std::getenv("LINA_BENCH_SVD_M");
+        const char* n_env = std::getenv("LINA_BENCH_SVD_N");
+        const char* it_env = std::getenv("LINA_BENCH_SVD_ITERS");
+        const char* data_env = std::getenv("LINA_BENCH_DATA_PATH");
+        const std::size_t m = m_env ? static_cast<std::size_t>(std::stoul(m_env)) : 5000;
+        const std::size_t n = n_env ? static_cast<std::size_t>(std::stoul(n_env)) : 2000;
+        const int iters = it_env ? std::stoi(it_env) : 1;
+        const std::string data_path = data_env ? data_env : "";
+        const auto input = build_svd_input(m, n, data_path);
+        const double avg_ms = lina::benchmark_svd_float_gpu_e2e_ms(input, iters);
+        std::cout << "BENCH_SVD_SIZE_GPU_E2E " << m << " " << n << " " << iters << " " << avg_ms << "\n";
+#else
+        std::cerr << "bench_svd_size_gpu_e2e requires LINA_USE_CUDA=ON\n";
+        return 1;
+#endif
+    } else if (cmd == "bench_svd_autocal") {
+#ifdef LINA_USE_CUDA
+        const auto cal = lina::calibrate_svd_float_gpu_threshold();
+        std::cout << "BENCH_SVD_AUTOCAL_THRESHOLD " << cal.threshold_elems
+                  << " SM_" << cal.sm << "\n";
+        for (const auto& p : cal.points) {
+            std::cout << "BENCH_SVD_AUTOCAL_POINT "
+                      << p.m << " " << p.n << " "
+                      << p.gesvd_ms << " " << p.gesvdj_ms << "\n";
+        }
+        std::cout << "BENCH_SVD_AUTOCAL_ACTIVE_THRESHOLD "
+                  << lina::svd_float_gpu_threshold_elems() << "\n";
+#else
+        std::cerr << "bench_svd_autocal requires LINA_USE_CUDA=ON\n";
         return 1;
 #endif
     } else if (cmd == "bench_svd_large") {

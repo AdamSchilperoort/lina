@@ -7,10 +7,18 @@
 
 #ifdef LINA_USE_OPENBLAS
 #include <cblas.h>
+extern "C" {
+int openblas_get_num_threads(void);
+void openblas_set_num_threads(int);
+}
 #endif
 
 #ifdef LINA_USE_LAPACKE
 #include <lapacke.h>
+#endif
+
+#ifdef _OPENMP
+#include <omp.h>
 #endif
 
 #ifdef LINA_USE_EIGEN_SVD
@@ -139,12 +147,11 @@ SvdResult svd(const Array2D<double>& a) {
     const lapack_int ldu = static_cast<lapack_int>(m);
     const lapack_int ldvt = static_cast<lapack_int>(n);
 
-    const lapack_int info = LAPACKE_dgesvd(
-        LAPACK_ROW_MAJOR, 'A', 'A', m_i, n_i,
-        a_copy.data(), lda, s.data(), u.data(), ldu, vt.data(), ldvt,
-        nullptr);
+    const lapack_int info = LAPACKE_dgesdd(
+        LAPACK_ROW_MAJOR, 'A', m_i, n_i,
+        a_copy.data(), lda, s.data(), u.data(), ldu, vt.data(), ldvt);
     if (info != 0) {
-        throw std::runtime_error("LAPACKE_dgesvd failed");
+        throw std::runtime_error("LAPACKE_dgesdd failed");
     }
 #elif defined(LINA_USE_EIGEN_SVD)
     Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> mat(
@@ -176,13 +183,11 @@ SvdResult svd(const Array2D<double>& a) {
     const lapack_int ldu = static_cast<lapack_int>(m);
     const lapack_int ldvt = static_cast<lapack_int>(n);
 
-    std::vector<double> superb(std::max<std::size_t>(1, s.size()) - 1, 0.0);
-    const lapack_int info = LAPACKE_dgesvd(
-        LAPACK_ROW_MAJOR, 'A', 'A', m_i, n_i,
-        a_copy.data(), lda, s.data(), u.data(), ldu, vt.data(), ldvt,
-        superb.empty() ? nullptr : superb.data());
+    const lapack_int info = LAPACKE_dgesdd(
+        LAPACK_ROW_MAJOR, 'A', m_i, n_i,
+        a_copy.data(), lda, s.data(), u.data(), ldu, vt.data(), ldvt);
     if (info != 0) {
-        throw std::runtime_error("LAPACKE_dgesvd failed");
+        throw std::runtime_error("LAPACKE_dgesdd failed");
     }
 #else
     throw std::runtime_error("SVD unavailable: build with LAPACKE or Eigen");
@@ -205,14 +210,11 @@ SvdResultF svd_float_cpu(const Array2D<float>& a) {
     const lapack_int lda = static_cast<lapack_int>(n);
     const lapack_int ldu = static_cast<lapack_int>(m);
     const lapack_int ldvt = static_cast<lapack_int>(n);
-    std::vector<float> superb(std::max<std::size_t>(1, s.size()) - 1, 0.0f);
-
-    const lapack_int info = LAPACKE_sgesvd(
-        LAPACK_ROW_MAJOR, 'A', 'A', m_i, n_i,
-        a_copy.data(), lda, s.data(), u.data(), ldu, vt.data(), ldvt,
-        superb.empty() ? nullptr : superb.data());
+    const lapack_int info = LAPACKE_sgesdd(
+        LAPACK_ROW_MAJOR, 'A', m_i, n_i,
+        a_copy.data(), lda, s.data(), u.data(), ldu, vt.data(), ldvt);
     if (info != 0) {
-        throw std::runtime_error("LAPACKE_sgesvd failed");
+        throw std::runtime_error("LAPACKE_sgesdd failed");
     }
 #elif defined(LINA_USE_EIGEN_SVD)
     Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> mat(
@@ -256,6 +258,24 @@ SvdResultF svd_float(const Array2D<float>& a) {
     return svd_float_cuda(a);
 #else
     return svd_float_cpu(a);
+#endif
+}
+
+void set_num_threads(int nthreads) {
+    if (nthreads < 1) nthreads = 1;
+#ifdef LINA_USE_OPENBLAS
+    openblas_set_num_threads(nthreads);
+#endif
+#ifdef _OPENMP
+    omp_set_num_threads(nthreads);
+#endif
+}
+
+int get_num_threads() {
+#ifdef LINA_USE_OPENBLAS
+    return openblas_get_num_threads();
+#else
+    return 1;
 #endif
 }
 

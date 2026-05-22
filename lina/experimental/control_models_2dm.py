@@ -1,4 +1,4 @@
-from .math_module import xp, xcipy, ensure_np_array
+from ..math_module import xp, xcipy, ensure_np_array
 from aefc_vortex import utils
 from aefc_vortex.imshows import imshow1, imshow2, imshow3
 from aefc_vortex import dm

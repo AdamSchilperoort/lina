@@ -297,6 +297,88 @@ Array2D<std::complex<double>> ifft_gpu(const Array2D<std::complex<double>>& arr)
     return fft_cufft(arr, true);
 }
 
+double benchmark_fft_gpu_e2e_ms(const Array2D<std::complex<double>>& arr, int iters) {
+    if (iters < 1) iters = 1;
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0); cudaEventCreate(&ev1);
+    cudaEventRecord(ev0);
+    for (int i = 0; i < iters; ++i) {
+        (void)fft_gpu(arr);
+    }
+    cudaEventRecord(ev1);
+    cudaEventSynchronize(ev1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+    return static_cast<double>(ms) / static_cast<double>(iters);
+}
+
+double benchmark_fft_gpu_xfer_ms(const Array2D<std::complex<double>>& arr, int iters) {
+    if (iters < 1) iters = 1;
+    const std::size_t count = arr.size();
+    const std::size_t bytes = sizeof(cufftDoubleComplex) * count;
+    cudaStream_t stm = fft_stream();
+    cufftDoubleComplex* d_buf = nullptr;
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_buf), bytes), "cudaMalloc fft xfer failed");
+    Array2D<std::complex<double>> out(arr.rows(), arr.cols(), {0.0, 0.0});
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0); cudaEventCreate(&ev1);
+    cudaEventRecord(ev0, stm);
+    for (int i = 0; i < iters; ++i) {
+        check_cuda(cudaMemcpyAsync(d_buf, arr.data(), bytes, cudaMemcpyHostToDevice, stm), "H2D fft");
+        check_cuda(cudaMemcpyAsync(out.data(), d_buf, bytes, cudaMemcpyDeviceToHost, stm), "D2H fft");
+    }
+    cudaEventRecord(ev1, stm);
+    cudaEventSynchronize(ev1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+    cudaFree(d_buf);
+    return static_cast<double>(ms) / static_cast<double>(iters);
+}
+
+double benchmark_fft_gpu_kernel_ms(const Array2D<std::complex<double>>& arr, int iters) {
+    if (iters < 1) iters = 1;
+    const std::size_t rows = arr.rows();
+    const std::size_t cols = arr.cols();
+    const std::size_t count = rows * cols;
+    const std::size_t bytes = sizeof(cufftDoubleComplex) * count;
+    cudaStream_t stm = fft_stream();
+    cufftHandle plan = cufft_cache().get_plan(rows, cols);
+    check_cufft(cufftSetStream(plan, stm), "cufftSetStream failed");
+
+    cufftDoubleComplex* d_src = nullptr;
+    cufftDoubleComplex* d_tmp = nullptr;
+    cufftDoubleComplex* d_out = nullptr;
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_src), bytes), "cudaMalloc d_src failed");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_tmp), bytes), "cudaMalloc d_tmp failed");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_out), bytes), "cudaMalloc d_out failed");
+    check_cuda(cudaMemcpyAsync(d_src, arr.data(), bytes, cudaMemcpyHostToDevice, stm), "H2D seed");
+
+    const std::size_t pre_r = rows / 2;
+    const std::size_t pre_c = cols / 2;
+    const std::size_t post_r = (rows + 1) / 2;
+    const std::size_t post_c = (cols + 1) / 2;
+    const dim3 block(16, 16);
+    const dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
+
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0); cudaEventCreate(&ev1);
+    cudaEventRecord(ev0, stm);
+    for (int i = 0; i < iters; ++i) {
+        shift2d_kernel<<<grid, block, 0, stm>>>(d_src, d_tmp, rows, cols, pre_r, pre_c);
+        check_cufft(cufftExecZ2Z(plan, d_tmp, d_tmp, CUFFT_FORWARD), "cufftExecZ2Z failed");
+        shift2d_kernel<<<grid, block, 0, stm>>>(d_tmp, d_out, rows, cols, post_r, post_c);
+    }
+    cudaEventRecord(ev1, stm);
+    cudaEventSynchronize(ev1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    cudaEventDestroy(ev0); cudaEventDestroy(ev1);
+    cudaFree(d_src); cudaFree(d_tmp); cudaFree(d_out);
+    return static_cast<double>(ms) / static_cast<double>(iters);
+}
+
 // ===========================================================================
 // CUDA kernels for elementwise phase-mask construction.
 // ===========================================================================
@@ -911,6 +993,15 @@ Array2D<std::complex<double>> mft_reverse_gpu(const Array2D<std::complex<double>
 }
 Array2D<std::complex<double>> get_fresnel_TF_gpu(double, std::size_t, double, double) {
     throw std::runtime_error("get_fresnel_TF_gpu unavailable: build with LINA_USE_CUDA=ON");
+}
+double benchmark_fft_gpu_e2e_ms(const Array2D<std::complex<double>>&, int) {
+    throw std::runtime_error("CUDA FFT unavailable: build with LINA_USE_CUDA=ON");
+}
+double benchmark_fft_gpu_kernel_ms(const Array2D<std::complex<double>>&, int) {
+    throw std::runtime_error("CUDA FFT unavailable: build with LINA_USE_CUDA=ON");
+}
+double benchmark_fft_gpu_xfer_ms(const Array2D<std::complex<double>>&, int) {
+    throw std::runtime_error("CUDA FFT unavailable: build with LINA_USE_CUDA=ON");
 }
 } // namespace lina
 

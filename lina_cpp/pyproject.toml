@@ -3,7 +3,7 @@
 # scikit-build-core (which isn't installed in this conda env). The custom
 # CMakeBuild command in setup.py runs cmake on ../cpp and drops the
 # compiled extension at lina_cpp/_core.so.
-requires = ["setuptools>=61", "wheel", "pybind11>=2.10", "cmake>=3.16"]
+requires = ["setuptools>=61", "wheel", "pybind11>=3.0.0", "cmake>=3.16"]
 build-backend = "setuptools.build_meta"
 
 [project]

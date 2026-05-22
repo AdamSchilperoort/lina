@@ -108,6 +108,23 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={ext_dir}",
         ]
 
+        # Force CMake to use the pybind11 that belongs to the *current*
+        # Python interpreter (the one pip/setuptools is building against),
+        # instead of a potentially older system pybind11 in /usr/include.
+        # This is critical on newer Python / NumPy stacks (e.g. 3.14 + NumPy 2)
+        # where old pybind11 releases can produce incorrect array bindings.
+        try:
+            pybind11_cmake_dir = subprocess.check_output(
+                [sys.executable, "-m", "pybind11", "--cmakedir"],
+                text=True,
+            ).strip()
+            if pybind11_cmake_dir:
+                common_args.append(f"-Dpybind11_DIR={pybind11_cmake_dir}")
+                print(f"[lina_cpp] pybind11_DIR={pybind11_cmake_dir}")
+        except Exception:
+            # Fall back to CMake's normal find_package(pybind11) behavior.
+            pass
+
         # Simple env-var toggle for the most common case: GPU build yes/no.
         # Accepts 1/0/on/off/true/false/yes/no/auto (any other value falls
         # through to the auto-detect path in CMakeLists.txt).
@@ -203,13 +220,18 @@ class CMakeBuild(build_ext):
                   f"-> {build_temp}")
             try:
                 subprocess.check_call(
-                    ["cmake", str(CPP_SOURCE_DIR), *attempt_cmake_args],
-                    cwd=build_temp,
+                    [
+                        "cmake",
+                        "-S",
+                        str(CPP_SOURCE_DIR),
+                        "-B",
+                        str(build_temp),
+                        *attempt_cmake_args,
+                    ],
                 )
                 print(f"[lina_cpp] Building extension into {ext_dir}")
                 subprocess.check_call(
                     ["cmake", "--build", str(build_temp), *build_args],
-                    cwd=build_temp,
                 )
                 break  # Success.
             except subprocess.CalledProcessError as exc:
