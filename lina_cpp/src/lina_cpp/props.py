@@ -50,7 +50,17 @@ def _prep_complex(arr):
 # FFT primitives
 # ---------------------------------------------------------------------------
 
-def fft(arr, device=None):
+def _sync_if_requested(sync):
+    if not sync:
+        return
+    try:
+        import cupy as _cp
+        _cp.cuda.Stream.null.synchronize()
+    except Exception:
+        pass
+
+
+def fft(arr, device=None, sync=False):
     """Forward 2D FFT with the lina convention (ifftshift -> fft -> fftshift).
 
     Parameters
@@ -62,17 +72,21 @@ def fft(arr, device=None):
     """
     impl = resolve_device("fft", device)
     arr = _prep_complex(arr)
-    return _core.fft_gpu(arr) if impl == "gpu" else _core.fft_cpu(arr)
+    out = _core.fft_gpu(arr) if impl == "gpu" else _core.fft_cpu(arr)
+    _sync_if_requested(sync)
+    return out
 
 
-def ifft(arr, device=None):
+def ifft(arr, device=None, sync=False):
     """Inverse 2D FFT with the lina convention (ifftshift -> ifft -> fftshift).
 
     See :func:`fft` for arguments.
     """
     impl = resolve_device("ifft", device)
     arr = _prep_complex(arr)
-    return _core.ifft_gpu(arr) if impl == "gpu" else _core.ifft_cpu(arr)
+    out = _core.ifft_gpu(arr) if impl == "gpu" else _core.ifft_cpu(arr)
+    _sync_if_requested(sync)
+    return out
 
 
 # Direct aliases for callers that already know exactly which backend
@@ -143,6 +157,7 @@ def mft_forward(
     pp_centering="odd",
     fp_centering="odd",
     device=None,
+    sync=False,
 ):
     """Pupil -> focal-plane matrix Fourier transform.
 
@@ -152,14 +167,18 @@ def mft_forward(
     impl = resolve_device("mft_forward", device)
     arr = _prep_complex(wavefront)
     if impl == "gpu":
-        return _core.mft_forward_gpu(
+        out = _core.mft_forward_gpu(
             arr, int(npix), int(npsf), float(psf_pixelscale_lamD),
             str(convention), str(pp_centering), str(fp_centering),
         )
-    return _core.mft_forward(
+        _sync_if_requested(sync)
+        return out
+    out = _core.mft_forward(
         arr, int(npix), int(npsf), float(psf_pixelscale_lamD),
         str(convention), str(pp_centering), str(fp_centering),
     )
+    _sync_if_requested(sync)
+    return out
 
 
 def mft_reverse(
@@ -171,6 +190,7 @@ def mft_reverse(
     pp_centering="odd",
     fp_centering="odd",
     device=None,
+    sync=False,
 ):
     """Focal-plane -> pupil matrix Fourier transform.
 
@@ -179,14 +199,18 @@ def mft_reverse(
     impl = resolve_device("mft_reverse", device)
     arr = _prep_complex(fpwf)
     if impl == "gpu":
-        return _core.mft_reverse_gpu(
+        out = _core.mft_reverse_gpu(
             arr, float(psf_pixelscale_lamD), int(npix), int(N),
             str(convention), str(pp_centering), str(fp_centering),
         )
-    return _core.mft_reverse(
+        _sync_if_requested(sync)
+        return out
+    out = _core.mft_reverse(
         arr, float(psf_pixelscale_lamD), int(npix), int(N),
         str(convention), str(pp_centering), str(fp_centering),
     )
+    _sync_if_requested(sync)
+    return out
 
 
 # ---------------------------------------------------------------------------

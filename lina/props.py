@@ -9,7 +9,16 @@ import os
 from pathlib import Path
 import copy
 
-def fft(arr):
+def _maybe_sync(sync):
+    if not sync:
+        return
+    try:
+        xp.cuda.Stream.null.synchronize()
+    except Exception:
+        pass
+
+
+def fft(arr, sync=False):
     """
     Compute the 2D Fourier Transform of an array with proper FFT shifts applied for the DC component. 
 
@@ -21,10 +30,12 @@ def fft(arr):
         ndarray:
             The Fourier Transform of the input array.  
     """
-    return xp.fft.ifftshift(xp.fft.fft2(xp.fft.fftshift(arr)))
+    out = xp.fft.ifftshift(xp.fft.fft2(xp.fft.fftshift(arr)))
+    _maybe_sync(sync)
+    return out
     # return xp.fft.ifftshift(xp.fft.fft2(arr))
 
-def ifft(arr):
+def ifft(arr, sync=False):
     """
     Compute the 2D Fourier Transform of an array with proper FFT shifts applied for the DC component. 
 
@@ -36,7 +47,9 @@ def ifft(arr):
         ndarray:
             The Fourier Transform of the input array.  
     """
-    return xp.fft.fftshift(xp.fft.ifft2(xp.fft.ifftshift(arr)))
+    out = xp.fft.fftshift(xp.fft.ifft2(xp.fft.ifftshift(arr)))
+    _maybe_sync(sync)
+    return out
     # return xp.fft.fftshift(xp.fft.ifft2(arr))
 
 def ang_spec(wavefront, wavelength, distance, pixelscale):
@@ -148,6 +161,7 @@ def mft_forward(
         convention='-', 
         pp_centering='odd', 
         fp_centering='odd',
+        sync=False,
     ):
     """
     Generate the matrices required to perform a forward Matrix Fourier Transform. 
@@ -212,7 +226,9 @@ def mft_forward(
         fp_centering=fp_centering,
     )
 
-    return Mx@wavefront@My * norm_coeff
+    out = Mx@wavefront@My * norm_coeff
+    _maybe_sync(sync)
+    return out
 
 def make_mft_reverse_matrices(
         npsf, 
@@ -284,6 +300,7 @@ def mft_reverse(
         convention='+', 
         pp_centering='odd', 
         fp_centering='odd',
+        sync=False,
     ):
     """
     Generate the matrices required to perform a reverse Matrix Fourier Transform. 
@@ -346,7 +363,9 @@ def mft_reverse(
         fp_centering=fp_centering,
     )
 
-    return Mx@fpwf@My * norm_coeff
+    out = Mx@fpwf@My * norm_coeff
+    _maybe_sync(sync)
+    return out
 
 def get_scaled_coords(N, scale, center=True, shift=True):
     if center:

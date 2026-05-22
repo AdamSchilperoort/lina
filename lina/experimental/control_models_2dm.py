@@ -1,8 +1,25 @@
 from ..math_module import xp, xcipy, ensure_np_array
-from aefc_vortex import utils
-from aefc_vortex.imshows import imshow1, imshow2, imshow3
-from aefc_vortex import dm
-from aefc_vortex import props
+try:
+    from aefc_vortex import utils
+    from aefc_vortex.imshows import imshow1, imshow2, imshow3
+    from aefc_vortex import dm
+    from aefc_vortex import props
+except ModuleNotFoundError:
+    # Fallback for environments where aefc_vortex is not installed.
+    # This keeps experimental imports usable for benchmarking scripts that
+    # depend on lina.experimental but do not require aefc_vortex-specific I/O.
+    from lina import utils
+    from lina import dm
+    from lina import props
+
+    def imshow1(*_args, **_kwargs):
+        return None
+
+    def imshow2(*_args, **_kwargs):
+        return None
+
+    def imshow3(*_args, **_kwargs):
+        return None
 
 import numpy as np
 import astropy.units as u
@@ -23,6 +40,10 @@ from matplotlib.gridspec import GridSpec
 
 from scipy.signal import windows
 from scipy.optimize import minimize
+
+def _to_xp_array(arr):
+    # Normalize possibly mixed numpy/cupy-like inputs into the active backend.
+    return xp.asarray(ensure_np_array(arr))
 
 def acts_to_command(acts, dm_mask):
     Nact = dm_mask.shape[0]
@@ -87,12 +108,16 @@ class MODEL():
 
         ### INITIALIZE APERTURES ###
         pwf = poppy.FresnelWavefront(beam_radius=self.lyot_pupil_diam/2 * u.m, npix=self.npix, oversample=self.def_oversample)
-        self.APERTURE = poppy.CircularAperture(radius=self.lyot_pupil_diam/2 * u.m).get_transmission(pwf)
-        self.LYOTSTOP = poppy.CircularAperture(radius=self.lyot_ratio * self.lyot_pupil_diam/2 * u.m).get_transmission(pwf)
+        self.APERTURE = _to_xp_array(
+            poppy.CircularAperture(radius=self.lyot_pupil_diam/2 * u.m).get_transmission(pwf)
+        )
+        self.LYOTSTOP = _to_xp_array(
+            poppy.CircularAperture(radius=self.lyot_ratio * self.lyot_pupil_diam/2 * u.m).get_transmission(pwf)
+        )
         self.BAP_MASK = self.APERTURE > 0.0
 
-        self.PREFPM_AMP = PREFPM_AMP if PREFPM_AMP is not None else xp.ones_like(self.APERTURE)
-        self.PREFPM_OPD = PREFPM_OPD if PREFPM_OPD is not None else xp.zeros_like(self.APERTURE)
+        self.PREFPM_AMP = _to_xp_array(PREFPM_AMP) if PREFPM_AMP is not None else xp.ones_like(self.APERTURE)
+        self.PREFPM_OPD = _to_xp_array(PREFPM_OPD) if PREFPM_OPD is not None else xp.zeros_like(self.APERTURE)
 
         self.flip_dm = False
         self.reverse_lyot = False
@@ -106,12 +131,12 @@ class MODEL():
         self.inf_sampling = self.act_spacing / self.dm_pxscl
 
         # construct DM influence function
-        self.inf_fun = dm.make_gaussian_inf_fun(
+        self.inf_fun = _to_xp_array(dm.make_gaussian_inf_fun(
             act_spacing=self.act_spacing, 
             sampling=self.inf_sampling, 
             coupling=act_coupling, 
             Nact=self.Nact+2,
-        )
+        ))
         self.Nsurf = self.inf_fun.shape[0]
 
         # construct DM mask
@@ -156,7 +181,11 @@ class MODEL():
         # because that is the only branch that can see the spot well enough. I am using POPPY to 
         # do this because I am too lazy to make my own code that computes gray pixels for the spot.
         pwf = poppy.FresnelWavefront(beam_radius=self.N_vortex_hres/2 * self.hres_sampling * u.mm, npix=self.N_vortex_hres, oversample=1)
-        self.hres_dot_mask = 1.0 - poppy.CircularAperture(radius= (self.vortex_dot_mask_diam_lamD/2) * u.mm).get_transmission(pwf)
+        self.hres_dot_mask = _to_xp_array(
+            1.0 - poppy.CircularAperture(
+                radius=(self.vortex_dot_mask_diam_lamD / 2) * u.mm
+            ).get_transmission(pwf)
+        )
         # utils.imshow([self.hres_dot_mask], npix=[20])
 
         self.windowed_vortex_lres = self.vortex_lres * (1 - self.lres_window) # apply low res (windowed) FPM
