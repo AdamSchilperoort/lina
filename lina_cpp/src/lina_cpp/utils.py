@@ -101,12 +101,14 @@ def create_annular_mask(
             edge=edge, x_shift=x_shift, y_shift=y_shift,
             return_np=return_np, centering=centering, rotation=rotation,
         )
-    return _core.create_annular_mask(
+    out = _core.create_annular_mask(
         int(N), float(pixelscale), float(irad), float(orad),
         edge=(None if edge is None else float(edge)),
         x_shift=float(x_shift), y_shift=float(y_shift),
         rotation=float(rotation),
     )
+    # Keep parity with lina.utils: masks are boolean arrays.
+    return out.astype(bool, copy=False)
 
 
 def create_annular_focal_plane_mask(
@@ -122,13 +124,15 @@ def create_annular_focal_plane_mask(
     return_np=False,
 ):
     """Focal-plane annular mask in lambda/D units. Matches lina.utils.* signature."""
-    return _core.create_annular_focal_plane_mask(
+    out = _core.create_annular_focal_plane_mask(
         int(npsf), float(psf_pixelscale), float(irad), float(orad),
         edge=(None if edge is None else float(edge)),
         centering=str(centering),
         rotation=float(rotation),
         x_shift=float(x_shift), y_shift=float(y_shift),
     )
+    # Keep parity with lina.utils: masks are boolean arrays.
+    return out.astype(bool, copy=False)
 
 
 def create_circ_mask(h, w, center=None, radius=None):
@@ -150,6 +154,12 @@ def save_fits(fpath, data, header=None, ow=True, quiet=False):
     # Stringify header values for the cfitsio C path.
     if header is not None:
         header = {str(k): str(v) for k, v in header.items()}
+    # C++ FITS writer currently expects a 2D primary image. For vectors or
+    # higher-D arrays, fall back to the Python implementation to preserve
+    # lina API behavior used by benchmark scripts.
+    if getattr(arr, "ndim", 0) != 2:
+        from lina.utils import save_fits as _save_fits_py
+        return _save_fits_py(fpath, arr, header=header, ow=ow, quiet=quiet)
     return _core.save_fits(str(fpath), arr, header=header, ow=bool(ow), quiet=bool(quiet))
 
 

@@ -174,6 +174,7 @@ _submodules = (
     "utils",
     "props",
     "dm",
+    "control_models",
     "coro_utils",
     "llowfsc",
     "rt_utils",

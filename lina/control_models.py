@@ -19,6 +19,19 @@ from matplotlib.colors import LogNorm, Normalize, CenteredNorm
 from matplotlib.patches import Circle, Rectangle
 from IPython.display import display, clear_output
 
+def _to_xp_array(arr):
+    return xp.asarray(ensure_np_array(arr))
+
+
+def _maybe_sync(sync):
+    if not sync:
+        return
+    try:
+        xp.cuda.Stream.null.synchronize()
+    except Exception:
+        pass
+
+
 def acts_to_command(acts, dm_mask):
     Nact = dm_mask.shape[0]
     command = xp.zeros((Nact,Nact))
@@ -79,12 +92,16 @@ class MODEL():
 
         ### INITIALIZE APERTURES ###
         pwf = poppy.FresnelWavefront(beam_radius=self.lyot_pupil_diam/2 * u.m, npix=self.npix, oversample=self.def_oversample)
-        self.APERTURE = poppy.CircularAperture(radius=self.lyot_pupil_diam/2 * u.m).get_transmission(pwf)
-        self.LYOTSTOP = poppy.CircularAperture(radius=self.lyot_ratio * self.lyot_pupil_diam/2 * u.m).get_transmission(pwf)
+        self.APERTURE = _to_xp_array(
+            poppy.CircularAperture(radius=self.lyot_pupil_diam/2 * u.m).get_transmission(pwf)
+        )
+        self.LYOTSTOP = _to_xp_array(
+            poppy.CircularAperture(radius=self.lyot_ratio * self.lyot_pupil_diam/2 * u.m).get_transmission(pwf)
+        )
         self.BAP_MASK = self.APERTURE > 0.0
 
-        self.PREFPM_AMP = PREFPM_AMP if PREFPM_AMP is not None else xp.ones_like(self.APERTURE)
-        self.PREFPM_OPD = PREFPM_OPD if PREFPM_OPD is not None else xp.zeros_like(self.APERTURE)
+        self.PREFPM_AMP = _to_xp_array(PREFPM_AMP) if PREFPM_AMP is not None else xp.ones_like(self.APERTURE)
+        self.PREFPM_OPD = _to_xp_array(PREFPM_OPD) if PREFPM_OPD is not None else xp.zeros_like(self.APERTURE)
 
         self.flip_dm = False
         self.reverse_lyot = False
@@ -98,12 +115,12 @@ class MODEL():
         self.inf_sampling = self.act_spacing / self.dm_pxscl
 
         # construct DM influence function
-        self.inf_fun = dm.make_gaussian_inf_fun(
+        self.inf_fun = _to_xp_array(dm.make_gaussian_inf_fun(
             act_spacing=self.act_spacing, 
             sampling=self.inf_sampling, 
             coupling=act_coupling, 
             Nact=self.Nact+2,
-        )
+        ))
         self.Nsurf = self.inf_fun.shape[0]
 
         # construct DM mask
@@ -148,7 +165,11 @@ class MODEL():
         # because that is the only branch that can see the spot well enough. I am using POPPY to 
         # do this because I am too lazy to make my own code that computes gray pixels for the spot.
         pwf = poppy.FresnelWavefront(beam_radius=self.N_vortex_hres/2 * self.hres_sampling * u.mm, npix=self.N_vortex_hres, oversample=1)
-        self.hres_dot_mask = 1.0 - poppy.CircularAperture(radius= (self.vortex_dot_mask_diam_lamD/2) * u.mm).get_transmission(pwf)
+        self.hres_dot_mask = _to_xp_array(
+            1.0 - poppy.CircularAperture(
+                radius=(self.vortex_dot_mask_diam_lamD / 2) * u.mm
+            ).get_transmission(pwf)
+        )
         # utils.imshow([self.hres_dot_mask], npix=[20])
 
         self.windowed_vortex_lres = self.vortex_lres * (1 - self.lres_window) # apply low res (windowed) FPM
@@ -166,6 +187,7 @@ class MODEL():
             use_vortex=True, 
             return_ints=False, 
             plot=False,
+            sync=False,
         ):
 
         if wavelength is None: wavelength = self.wavelength_c
@@ -253,6 +275,7 @@ class MODEL():
                 hspace=0.2, wspace=0.2, 
             )
 
+        _maybe_sync(sync)
         if return_ints:
             return E_FP, E_EP, DM_PHASOR
         else:
@@ -297,6 +320,7 @@ def val_and_grad(
         rmad_vars, 
         verbose=False, 
         plot=False, 
+        sync=False,
     ):
     # Convert array arguments into correct types
     del_acts = xp.array(del_acts)
@@ -410,6 +434,7 @@ def val_and_grad(
             hspace=0.2, wspace=0.2, 
         )
 
+    _maybe_sync(sync)
     return ensure_np_array(J), ensure_np_array(dJ_dA_vec)
 
 def val_and_grad_mw(
@@ -419,6 +444,7 @@ def val_and_grad_mw(
         verbose=False, 
         plot=False,  
         plot_all=False,
+        sync=False,
     ):
     # del_acts, M, actuators, E_ab, wfs_mask, wavelength, r_cond,
     current_acts = xp.array(rmad_vars['current_acts'])
@@ -495,6 +521,7 @@ def val_and_grad_mw(
         dJ_dA_bb = np.sum(weights[:, None] * dJ_dA_monos, axis=0) / np.sum(weights) + ensure_np_array( r_cond * 2*del_acts_waves )
 
     
+    _maybe_sync(sync)
     return J_bb, dJ_dA_bb
 
 

@@ -45,6 +45,15 @@ def _to_xp_array(arr):
     # Normalize possibly mixed numpy/cupy-like inputs into the active backend.
     return xp.asarray(ensure_np_array(arr))
 
+
+def _maybe_sync(sync):
+    if not sync:
+        return
+    try:
+        xp.cuda.Stream.null.synchronize()
+    except Exception:
+        pass
+
 def acts_to_command(acts, dm_mask):
     Nact = dm_mask.shape[0]
     command = xp.zeros((Nact,Nact))
@@ -204,6 +213,7 @@ class MODEL():
             use_vortex=True, 
             return_ints=False, 
             plot=False,
+            sync=False,
         ):
 
         if wavelength is None: wavelength = self.wavelength_c
@@ -306,6 +316,7 @@ class MODEL():
                 hspace=0.2, wspace=0.2, 
             )
 
+        _maybe_sync(sync)
         if return_ints:
             return E_FP, E_EP, DM1_PHASOR, E_DM2P, DM2_PHASOR
         else:
@@ -351,6 +362,7 @@ def val_and_grad(
         rmad_vars, 
         verbose=False, 
         plot=False, 
+        sync=False,
     ):
     # Convert array arguments into correct types
     del_acts = xp.array(del_acts)
@@ -425,12 +437,17 @@ def val_and_grad(
 
     dJ_dE_DM2 = props.ang_spec(dJ_dE_PUP, wavelength, M.z_dm1_dm2, M.dm_pxscl)
 
-    dJ_dE_DM2P = dJ_dE_DM2 * DM2_PHASOR.conj()
+    dm2_phasor_padded = utils.pad_or_crop(DM2_PHASOR, dJ_dE_DM2.shape[0])
+    dJ_dE_DM2P = dJ_dE_DM2 * dm2_phasor_padded.conj()
 
-    dJ_dE_DM1 = props.ang_spec(dJ_dE_DM2P, wavelength, -M.d_dm1_dm2, M.dm_pxscl)
+    dm_sep = getattr(M, "z_dm1_dm2", getattr(M, "d_dm1_dm2", None))
+    if dm_sep is None:
+        raise AttributeError("MODEL is missing DM separation attribute (z_dm1_dm2 / d_dm1_dm2)")
+    dJ_dE_DM1 = props.ang_spec(dJ_dE_DM2P, wavelength, -dm_sep, M.dm_pxscl)
 
-    dJ_dS_DM2 = 4*xp.pi/wavelength * xp.imag(dJ_dE_DM2 * E_DM2P.conj() * DM2_PHASOR.conj())
-    dJ_dS_DM1 = 4*xp.pi/wavelength * xp.imag(dJ_dE_DM1 * E_EP.conj() * DM1_PHASOR.conj())
+    dJ_dS_DM2 = 4*xp.pi/wavelength * xp.imag(dJ_dE_DM2 * E_DM2P.conj() * dm2_phasor_padded.conj())
+    dm1_phasor_padded = utils.pad_or_crop(DM1_PHASOR, dJ_dE_DM1.shape[0])
+    dJ_dS_DM1 = 4*xp.pi/wavelength * xp.imag(dJ_dE_DM1 * E_EP.conj() * dm1_phasor_padded.conj())
     if M.flip_dm: 
         dJ_dS_DM2 = xp.rot90(xp.rot90(dJ_dS_DM2))
         dJ_dS_DM1 = xp.rot90(xp.rot90(dJ_dS_DM1))
@@ -446,7 +463,6 @@ def val_and_grad(
     x1_bar = M.inf_fun_fft.conjugate() * x2_bar
     dJ_dA1 = M.Mx_dm_back@x1_bar@M.My_dm_back / ( M.Nsurf * M.Nact * M.Nact ) # why I have to divide by this constant is beyond me
 
-    dJ_dA_vec = dJ_dA[M.dm_mask].real + xp.array( r_cond * 2*del_acts_waves )
     dJ_dA = xp.concatenate([dJ_dA1[M.dm_mask].real, dJ_dA2[M.dm_mask].real]) + xp.array( r_cond * 2*del_acts_waves )
 
     if plot: 
@@ -483,15 +499,17 @@ def val_and_grad(
             hspace=0.2, wspace=0.2, 
         )
 
-    return ensure_np_array(J), ensure_np_array(dJ_dA_vec)
+    _maybe_sync(sync)
+    return ensure_np_array(J), ensure_np_array(dJ_dA)
 
-def val_and_grad(
+def val_and_grad_legacy(
         del_acts, 
         M, 
         rmad_vars,
         verbose=False, 
         plot=False, 
         fancy_plot=False,
+        sync=False,
     ):
     # Convert array arguments into correct types
     del_acts = xp.array(del_acts)
@@ -595,6 +613,7 @@ def val_and_grad(
     if fancy_plot: 
         fancy_plot_adjoint(dJ_ddeltaE, dJ_dE_LP, dJ_dE_PUP, dJ_dS_DM1, dJ_dS_DM2, dJ_dA1, dJ_dA2, control_mask)
 
+    _maybe_sync(sync)
     return ensure_np_array(J), ensure_np_array(dJ_dA)
 
 

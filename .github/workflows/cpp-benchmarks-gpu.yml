@@ -1,0 +1,25 @@
+name: cpp-benchmarks-gpu
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmarks:
+    # Intended for your self-hosted GPU runner where conda and cupy130_copy exist.
+    runs-on: self-hosted
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run benchmark suite in cupy130_copy
+        run: |
+          conda run --no-capture-output -n cupy130_copy \
+            env LINA_RUN_BENCHMARKS=1 \
+            python -m pytest lina/tests/test_benchmarks.py -q
+
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: lina/tests/bench_report.md
