@@ -7,18 +7,15 @@ naming conventions, and how the thin Python wrapper layer works.
 `lina_cpp` is a **self-contained, standalone package**. It does not import the
 externally installed `lina` at runtime; the still-Python helpers it needs are
 vendored privately under `lina_cpp._pyref`. `lina_cpp` and the pure-Python
-`lina` (from `lina_kian`) are two independent repositories with equivalent
+`lina` are two independent repositories with equivalent
 functionality that can be installed side-by-side for parity comparison.
 
 ---
 
-## 1. Repository layout (and what changed)
-
-The repo was flattened so the **repo root is the package root** (previously the
-package was nested at `lina_cpp/lina_cpp/`).
+## 1. Repository layout
 
 ```
-lina_cpp/                      # repo root == package root
+lina_cpp/                      # repo root & package root
 ├── cpp/                       # C++/CUDA implementation (the backend)
 │   ├── include/lina/*.h       # public headers
 │   ├── src/*.cpp              # CPU implementations
@@ -28,20 +25,20 @@ lina_cpp/                      # repo root == package root
 ├── src/lina_cpp/              # Python wrapper package
 │   ├── __init__.py            # extension load, backend toggle, thread cap
 │   ├── _dispatch.py           # CPU/GPU device selection
-│   ├── _core*.so              # compiled pybind11 extension (gitignored)
+│   ├── _core*.so              # compiled pybind11 extension (built & gitignored)
 │   ├── _pyref/                # vendored pure-Python reference (un-ported helpers)
 │   ├── math_module.py utils.py props.py dm.py wfe.py control_models.py
 │   ├── iefc.py efc.py aefc.py coro_utils.py llowfsc.py rt_utils.py ...
 ├── notebooks/
-│   ├── sim_iefc_demo_lina_cpp_native.ipynb   # the lina_cpp demo
+│   ├── sim_iefc_demo_lina_cpp_native.ipynb   # lina_cpp iefc, comparable to sim_iefc_demo in lina
 │   └── ...
 ├── pyproject.toml             # installable package metadata (src/ layout)
 ├── setup.py                   # CMake-driven build of cpp/ -> _core.so
 ├── README.md
-└── CONVERSION.md              # this file
+└── CONVERSION.md              # conversion notes py->c++
 ```
 
-### Layout convention changes (from → to)
+### Layout convention changes (from -> to)
 
 | Old | New |
 | --- | --- |
@@ -52,16 +49,7 @@ lina_cpp/                      # repo root == package root
 
 ---
 
-## 2. What to check in
-
-Run `git add -A` from the repo root. The diff comprises:
-
-**Restructure (flatten + vendoring)** — appears in `git status` as deletes of the
-old nested paths and an untracked `src/`:
-- Deleted: `lina/**` (old in-repo Python copy), `lina_cpp/**` (old nested package).
-- Added: `src/lina_cpp/**` (flattened package, incl. vendored `src/lina_cpp/_pyref/**`).
-- Modified: root `pyproject.toml`, `setup.py`, `README.md` (now describe the
-  flattened, self-contained package).
+## 2. Code Changes
 
 **C++/CUDA backend changes:**
 - `cpp/src/control_models_cuda.cu` *(new)* — device-resident GPU optical forward.
@@ -83,14 +71,9 @@ old nested paths and an untracked `src/`:
 - `src/lina_cpp/control_models.py` — `MODEL_CPP` (C++-backed), `solve_flat_command`.
 - `src/lina_cpp/iefc.py` — native calibrate dispatch + progress printing.
 
-**New:** `notebooks/sim_iefc_demo_lina_cpp_native.ipynb`, `CONVERSION.md`.
-
-> Do **not** commit the compiled extension (`src/lina_cpp/_core*.so`) or `build/`
-> — these are gitignored (everyone builds locally).
-
 ---
 
-## 3. Python → C++ function conversion map
+## 3. Python -> C++ function re-mapping
 
 The compiled extension is `lina_cpp._core` (built from `cpp/pybind/lina_py.cpp`).
 Each Python wrapper module delegates its math hot paths to `_core` and re-exports
@@ -156,27 +139,26 @@ the remaining (un-ported) helpers from `lina_cpp._pyref`.
 
 ---
 
-## 4. Native CUDA additions (new this conversion)
+## 4. Native CUDA additions
 
 - **Device-resident optical `forward`** (`control_models_cuda.cu`): the whole
   coronagraph forward (DM phasor, vortex dual-resolution propagation, Lyot,
   focal MFT) runs on the GPU with all intermediates kept on-device; only the
-  final focal-plane field is copied to host. ~200× faster than the
-  host-round-tripping path; matches the CPU path to ~1e-15.
+  final focal-plane field is copied to host.
 - **`beta_reg_gpu`** (`linalg_cuda.cu`): control-matrix inverse as cuBLAS GEMM +
-  cuSOLVER Cholesky solve, entirely on the GPU.
-- **Native iEFC `calibrate_control_model`**: the calibration loop runs in C++
-  calling the device-resident forward; 1024 modes in ~22 s (matching Python),
-  with a per-mode progress callback surfaced to the notebook.
+  cuSOLVER Cholesky solve, entirely on GPU.
+- **Native iEFC `calibrate_control_model`**: calibration loop runs in C++
+  calling the device-resident forward; 1024 modes in ~22 s with a per-mode progress 
+  callback surfaced in the sim_iefc_demo_lina_cpp_native.ipynb notebook.
 
-### Correctness fixes made during conversion
+### "Correctness" fixes made during conversion
 - MFT `npix` is a fractional **sampling scale** (`dx = 1/npix`), not an array
   size — it is now `double` (was truncated to `size_t`, causing a ~1e-4 PSF
   scale error / "shifted" PSF).
-- The C++ model uses the **poppy** aperture / Lyot stop / vortex masks (pushed
+- The C++ model still uses the **poppy** aperture / Lyot stop / vortex masks (pushed
   in from Python via `set_aperture`/`set_lyotstop`/`set_windowed_vortex_*`/
   `set_dm_model`) instead of hard-edged C++ circles, so the gray-pixel edges
-  match the reference (coronagraph parity to ~1e-15).
+  match the reference (parity to ~1e-15).
 - `svd_thin` (economy SVD): avoids an O(m²) full-U allocation that made
   `lstsq` over a flattened image (m ~ 1e5) try to allocate ~500 GB.
 
@@ -224,7 +206,10 @@ minutes instead of <1 s).
 
 ## 6. What is still Python (and why)
 
-These remain Python on purpose (no compute benefit, or external deps):
+lina_cpp back-end code will become a library linked in MagAOX for performing iefc and other math ops,
+however this python-wrapped version is as a way of bridging the gap between the testing and simulation 
+progressing in the pure python lina, enabling a side-by-side comparison before feeling confident about
+the pure C++ functionality. iefc is fully converted but efc, aefc, have superficial python still:
 
 | Area | Where | Why |
 | --- | --- | --- |
@@ -232,8 +217,8 @@ These remain Python on purpose (no compute benefit, or external deps):
 | plotting (`utils.imshow`, `plot_*`) | `_pyref` | matplotlib |
 | hardware I/O (`coro_utils` INDI camera/DM/stage functions) | `_pyref` | instrument control |
 | high-level loops `efc.run`, `aefc.run`, `efc/aefc.calibrate` | `_pyref` | orchestration; the math primitives they call are C++ |
-| flat-DM `dm_val_and_grad` (default) | `control_models.py` (cupy) | matches the reference at the weakly-constrained aperture-rim actuators; a native C++ endpoint (`control_model_dm_val_and_grad`) and a fully native solver (`control_model_solve_flat`) are also available (opt in with `LINA_CPP_NATIVE_DM_VG=1`) |
-| thin glue in `MODEL_CPP` (e.g. `xp.asarray` of C++ results, optional focal rotation) | `control_models.py` | marshalling around the C++ forward |
+| flat-DM `dm_val_and_grad` (default) | `control_models.py` (cupy) | matches the reference at the weakly-constrained aperture-rim actuators; a native C++ endpoint (`control_model_dm_val_and_grad`) and a fully native solver (`control_model_solve_flat`) are also available (opt in with `LINA_CPP_NATIVE_DM_VG=1`) but `dm_val_and_grad` C++ is still suffering from errors |
+| thin glue in `MODEL_CPP` (e.g. `xp.asarray` of C++ results, optional focal rotation, as rotation in cupy is different for some reason (e.g. 90 == 270 in C++)) | `control_models.py` | marshalling around the C++ forward |
 
 ---
 
@@ -244,7 +229,7 @@ These remain Python on purpose (no compute benefit, or external deps):
 python -m pip install -e . --no-build-isolation
 
 # Optional pure-Python baseline for parity comparison (kept separate):
-python -m pip install -e /path/to/lina_kian   # provides `import lina`
+python -m pip install -e /path/to/lina   # provides `import lina`
 ```
 Requires: C++17, CMake ≥ 3.16, FFTW3, OpenBLAS, LAPACKE, cfitsio, libLBFGS, and
 (optionally) the CUDA toolkit for the GPU paths.
