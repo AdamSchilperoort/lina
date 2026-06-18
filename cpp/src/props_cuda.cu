@@ -846,7 +846,7 @@ Array2D<std::complex<double>> ang_spec_gpu(const Array2D<std::complex<double>>& 
 
 Array2D<std::complex<double>> mft_forward_gpu(
     const Array2D<std::complex<double>>& wavefront,
-    std::size_t npix,
+    double npix,
     std::size_t npsf,
     double psf_pixelscale_lamD,
     char convention,
@@ -857,7 +857,7 @@ Array2D<std::complex<double>> mft_forward_gpu(
     if (N != wavefront.cols()) {
         throw std::invalid_argument("mft_forward_gpu expects square wavefront");
     }
-    const double dx = 1.0 / static_cast<double>(npix);
+    const double dx = 1.0 / npix;
     const double du = psf_pixelscale_lamD;
 
     const auto Xs = mft_coords(N, dx,    pp_centering ? pp_centering : "odd");
@@ -892,7 +892,7 @@ Array2D<std::complex<double>> mft_forward_gpu(
     zgemm_rm(handle, npsf, npsf, N, T_buf->d, My->d_M, O_buf->d, one, zero);
 
     // Scale by psf_pixelscale_lamD / npix in-place on the device.
-    const double scale = psf_pixelscale_lamD / static_cast<double>(npix);
+    const double scale = psf_pixelscale_lamD / npix;
     const cuDoubleComplex scale_cplx = make_cuDoubleComplex(scale, 0.0);
     check_cublas(cublasZscal(handle, static_cast<int>(npsf * npsf),
                               &scale_cplx, O_buf->d, 1),
@@ -907,7 +907,7 @@ Array2D<std::complex<double>> mft_forward_gpu(
 Array2D<std::complex<double>> mft_reverse_gpu(
     const Array2D<std::complex<double>>& fpwf,
     double psf_pixelscale_lamD,
-    std::size_t npix,
+    double npix,
     std::size_t N,
     char convention,
     const char* pp_centering,
@@ -918,7 +918,7 @@ Array2D<std::complex<double>> mft_reverse_gpu(
         throw std::invalid_argument("mft_reverse_gpu expects square focal plane");
     }
     const double du = psf_pixelscale_lamD;
-    const double dx = 1.0 / static_cast<double>(npix);
+    const double dx = 1.0 / npix;
 
     const auto Us = mft_coords(npsf, du, fp_centering ? fp_centering : "odd");
     const auto Xs = mft_coords(N,    dx, pp_centering ? pp_centering : "odd");
@@ -951,7 +951,7 @@ Array2D<std::complex<double>> mft_reverse_gpu(
     // O = T @ My  (N x N) = (N x npsf)(npsf x N)
     zgemm_rm(handle, N, N, npsf, T_buf->d, My->d_M, O_buf->d, one, zero);
 
-    const double scale = psf_pixelscale_lamD / static_cast<double>(npix);
+    const double scale = psf_pixelscale_lamD / npix;
     const cuDoubleComplex scale_cplx = make_cuDoubleComplex(scale, 0.0);
     check_cublas(cublasZscal(handle, static_cast<int>(N * N),
                               &scale_cplx, O_buf->d, 1),

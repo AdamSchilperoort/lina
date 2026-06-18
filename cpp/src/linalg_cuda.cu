@@ -12,7 +12,9 @@
 #ifdef LINA_USE_CUDA
 
 #include <cusolverDn.h>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 
 namespace lina {
 
@@ -28,6 +30,33 @@ void check_cusolver(cusolverStatus_t status, const char* msg) {
     if (status != CUSOLVER_STATUS_SUCCESS) {
         throw std::runtime_error(msg);
     }
+}
+
+void check_cublas(cublasStatus_t status, const char* msg) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(msg);
+    }
+}
+
+cublasHandle_t blas_handle() {
+    static cublasHandle_t h = [] {
+        cublasHandle_t tmp = nullptr;
+        check_cublas(cublasCreate(&tmp), "cublasCreate failed");
+        return tmp;
+    }();
+    return h;
+}
+
+// Gather the diagonal of a column-major (n x n) matrix into a contiguous buffer.
+__global__ void gather_diag_kernel(const double* A, double* d, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = A[static_cast<long long>(i) * (n + 1)];
+}
+
+// Add a scalar to the diagonal of a column-major (n x n) matrix in place.
+__global__ void add_diag_kernel(double* A, int n, double val) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) A[static_cast<long long>(i) * (n + 1)] += val;
 }
 
 struct SvdKey {
@@ -559,6 +588,103 @@ SvdCalibrationResult calibrate_svd_float_gpu_threshold() {
     return cal;
 }
 
+Array2D<double> beta_reg_gpu(const Array2D<double>& S, double beta) {
+    const std::size_t m = S.rows();
+    const std::size_t n = S.cols();
+    const int ni = static_cast<int>(n);
+    const int mi = static_cast<int>(m);
+
+    // Upload S (m x n row-major). Interpreted by cuBLAS as a column-major
+    // (n x m) matrix, this device buffer IS S^T (col-major). Call it dST.
+    double* dST = nullptr;   // (n x m) col-major == S^T
+    double* dA = nullptr;    // (n x n) col-major == S^T S (symmetric)
+    double* dB = nullptr;    // (n x m) col-major RHS / solution
+    double* d_diag = nullptr;
+    double* d_work = nullptr;
+    int* d_info = nullptr;
+    check_cuda(cudaMalloc(&dST, sizeof(double) * m * n), "cudaMalloc dST");
+    check_cuda(cudaMalloc(&dA, sizeof(double) * n * n), "cudaMalloc dA");
+    check_cuda(cudaMalloc(&dB, sizeof(double) * m * n), "cudaMalloc dB");
+    check_cuda(cudaMalloc(&d_diag, sizeof(double) * n), "cudaMalloc d_diag");
+    check_cuda(cudaMalloc(&d_info, sizeof(int)), "cudaMalloc d_info");
+
+    auto cleanup = [&]() {
+        if (dST) cudaFree(dST);
+        if (dA) cudaFree(dA);
+        if (dB) cudaFree(dB);
+        if (d_diag) cudaFree(d_diag);
+        if (d_work) cudaFree(d_work);
+        if (d_info) cudaFree(d_info);
+    };
+
+    try {
+        check_cuda(cudaMemcpy(dST, S.data(), sizeof(double) * m * n, cudaMemcpyHostToDevice),
+                   "H2D S");
+        // RHS B = S^T (copy of dST).
+        check_cuda(cudaMemcpy(dB, dST, sizeof(double) * m * n, cudaMemcpyDeviceToDevice),
+                   "D2D B=S^T");
+
+        // A = S^T S = dST (n x m) * dST^T (m x n)  -> (n x n), col-major.
+        const double one = 1.0, zero = 0.0;
+        check_cublas(cublasDgemm(blas_handle(), CUBLAS_OP_N, CUBLAS_OP_T,
+                                 ni, ni, mi, &one, dST, ni, dST, ni, &zero, dA, ni),
+                     "cublasDgemm S^T S");
+
+        // alpha2 = max diagonal of A.
+        const int block = 256;
+        const int grid = (ni + block - 1) / block;
+        gather_diag_kernel<<<grid, block>>>(dA, d_diag, ni);
+        check_cuda(cudaGetLastError(), "gather_diag_kernel");
+        std::vector<double> diag(n, 0.0);
+        check_cuda(cudaMemcpy(diag.data(), d_diag, sizeof(double) * n, cudaMemcpyDeviceToHost),
+                   "D2H diag");
+        double alpha2 = 0.0;
+        for (double v : diag) alpha2 = std::max(alpha2, v);
+        const double reg = alpha2 * std::pow(10.0, beta);
+
+        // A += reg * I.
+        add_diag_kernel<<<grid, block>>>(dA, ni, reg);
+        check_cuda(cudaGetLastError(), "add_diag_kernel");
+
+        // Cholesky factor + solve  A X = B  (A SPD).  X overwrites dB.
+        const cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER;
+        int lwork = 0;
+        check_cusolver(cusolverDnDpotrf_bufferSize(svd_handle(), uplo, ni, dA, ni, &lwork),
+                       "Dpotrf_bufferSize");
+        check_cuda(cudaMalloc(&d_work, sizeof(double) * std::max(lwork, 1)), "cudaMalloc work");
+        check_cusolver(cusolverDnDpotrf(svd_handle(), uplo, ni, dA, ni, d_work, lwork, d_info),
+                       "Dpotrf");
+        int info = 0;
+        check_cuda(cudaMemcpy(&info, d_info, sizeof(int), cudaMemcpyDeviceToHost), "D2H info potrf");
+        if (info != 0) {
+            throw std::runtime_error("beta_reg_gpu: Cholesky failed (info=" + std::to_string(info) + ")");
+        }
+        check_cusolver(cusolverDnDpotrs(svd_handle(), uplo, ni, mi, dA, ni, dB, ni, d_info),
+                       "Dpotrs");
+        check_cuda(cudaMemcpy(&info, d_info, sizeof(int), cudaMemcpyDeviceToHost), "D2H info potrs");
+        if (info != 0) {
+            throw std::runtime_error("beta_reg_gpu: solve failed (info=" + std::to_string(info) + ")");
+        }
+
+        // dB is now control = inv(A) @ S^T, shape (n x m) col-major.
+        // Download and transpose into row-major (n x m).
+        std::vector<double> host(m * n, 0.0);
+        check_cuda(cudaMemcpy(host.data(), dB, sizeof(double) * m * n, cudaMemcpyDeviceToHost),
+                   "D2H control");
+        Array2D<double> control(n, m, 0.0);
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t j = 0; j < m; ++j) {
+                control(i, j) = host[j * n + i];  // col-major (i,j) -> row-major
+            }
+        }
+        cleanup();
+        return control;
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+}
+
 } // namespace lina
 
 #else
@@ -582,6 +708,9 @@ std::size_t svd_float_gpu_threshold_elems() {
 }
 SvdCalibrationResult calibrate_svd_float_gpu_threshold() {
     throw std::runtime_error("CUDA SVD unavailable: build with LINA_USE_CUDA=ON");
+}
+Array2D<double> beta_reg_gpu(const Array2D<double>&, double) {
+    throw std::runtime_error("beta_reg_gpu unavailable: build with LINA_USE_CUDA=ON");
 }
 } // namespace lina
 

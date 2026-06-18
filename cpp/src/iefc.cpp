@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <stdexcept>
 #include <thread>
 
 namespace lina {
@@ -20,6 +22,92 @@ std::vector<std::size_t> mask_indices(const Array2D<std::uint8_t>& mask) {
         }
     }
     return indices;
+}
+
+std::vector<double> command_to_actuators(
+    const Array2D<double>& command,
+    const Array2D<std::uint8_t>& dm_mask) {
+    if (command.rows() != dm_mask.rows() || command.cols() != dm_mask.cols()) {
+        throw std::invalid_argument("command_to_actuators shape mismatch");
+    }
+    std::vector<double> acts;
+    acts.reserve(dm_mask.size());
+    for (std::size_t i = 0; i < dm_mask.size(); ++i) {
+        if (dm_mask.data()[i]) {
+            acts.push_back(command.data()[i]);
+        }
+    }
+    return acts;
+}
+
+Array2D<double> model_intensity_image(
+    ControlModel& model,
+    const Array2D<double>& total_command,
+    bool use_vortex,
+    double imax_ref) {
+    const auto acts = command_to_actuators(total_command, model.dm_mask());
+    const auto e_fp = model.forward(acts, model.wavelength(), use_vortex);
+    const double norm = (imax_ref > 0.0) ? imax_ref : 1.0;
+    Array2D<double> im(e_fp.rows(), e_fp.cols(), 0.0);
+    for (std::size_t i = 0; i < e_fp.size(); ++i) {
+        im.data()[i] = std::norm(e_fp.data()[i]) / norm;
+    }
+    return im;
+}
+
+Array2D<double> measure_probe_response_control_model(
+    ControlModel& model,
+    const Array2D<double>& base_command,
+    const Array2D<double>& probe_modes,
+    double probe_amplitude,
+    std::size_t image_size,
+    bool use_vortex,
+    double imax_ref) {
+    const std::size_t nprobes = probe_modes.rows();
+    const std::size_t nact = static_cast<std::size_t>(std::sqrt(probe_modes.cols()));
+    if (nact * nact != probe_modes.cols()) {
+        throw std::invalid_argument("probe_modes second dimension must be square");
+    }
+    if (base_command.rows() != nact || base_command.cols() != nact) {
+        throw std::invalid_argument("base_command shape mismatch");
+    }
+    if (probe_amplitude == 0.0) {
+        throw std::invalid_argument("probe_amplitude must be non-zero");
+    }
+
+    Array2D<double> responses(nprobes, image_size, 0.0);
+
+    for (std::size_t p = 0; p < nprobes; ++p) {
+        Array2D<double> probe(nact, nact, 0.0);
+        for (std::size_t r = 0; r < nact; ++r) {
+            for (std::size_t c = 0; c < nact; ++c) {
+                probe(r, c) = probe_amplitude * probe_modes(p, r * nact + c);
+            }
+        }
+
+        Array2D<double> cmd_pos(nact, nact, 0.0);
+        Array2D<double> cmd_neg(nact, nact, 0.0);
+        for (std::size_t r = 0; r < nact; ++r) {
+            for (std::size_t c = 0; c < nact; ++c) {
+                cmd_pos(r, c) = base_command(r, c) + probe(r, c);
+                cmd_neg(r, c) = base_command(r, c) - probe(r, c);
+            }
+        }
+
+        const Array2D<double> im_pos = model_intensity_image(
+            model, cmd_pos, use_vortex, imax_ref);
+        const Array2D<double> im_neg = model_intensity_image(
+            model, cmd_neg, use_vortex, imax_ref);
+        if (im_pos.size() != image_size || im_neg.size() != image_size) {
+            throw std::runtime_error("ControlModel image size mismatch in probe response");
+        }
+
+        for (std::size_t idx = 0; idx < im_pos.size(); ++idx) {
+            responses(p, idx) = (im_pos.data()[idx] - im_neg.data()[idx]) /
+                                (2.0 * probe_amplitude);
+        }
+    }
+    return responses;
 }
 
 } // namespace
@@ -170,6 +258,103 @@ Array2D<double> calibrate(Stream2D& camsci,
         }
     }
     return response_matrix;
+}
+
+IefcCalibrationResult calibrate_control_model(
+    ControlModel& model,
+    const Array2D<std::uint8_t>& control_mask,
+    double probe_amplitude,
+    const Array2D<double>& probe_modes,
+    double calibration_amplitude,
+    const Array2D<double>& calibration_modes,
+    const std::vector<double>& scale_factors,
+    std::optional<Array2D<double>> initial_command,
+    bool use_vortex,
+    double imax_ref,
+    const std::function<void(std::size_t, std::size_t)>& progress) {
+    const std::size_t ncam = control_mask.rows();
+    if (control_mask.cols() != ncam) {
+        throw std::invalid_argument("control_mask must be square");
+    }
+    const std::size_t nact = static_cast<std::size_t>(std::sqrt(probe_modes.cols()));
+    if (nact * nact != probe_modes.cols()) {
+        throw std::invalid_argument("probe_modes second dimension must be square");
+    }
+    if (calibration_modes.cols() != nact * nact) {
+        throw std::invalid_argument("calibration_modes second dimension mismatch");
+    }
+    const std::size_t nprobes = probe_modes.rows();
+    const std::size_t nmodes = calibration_modes.rows();
+    if (!scale_factors.empty() && scale_factors.size() != nmodes) {
+        throw std::invalid_argument("scale_factors length must match calibration modes");
+    }
+    if (calibration_amplitude == 0.0) {
+        throw std::invalid_argument("calibration_amplitude must be non-zero");
+    }
+
+    Array2D<double> base0 = initial_command.value_or(Array2D<double>(nact, nact, 0.0));
+    if (base0.rows() != nact || base0.cols() != nact) {
+        throw std::invalid_argument("initial_command shape mismatch");
+    }
+
+    const std::vector<std::size_t> mask_idx = mask_indices(control_mask);
+    const std::size_t nmask = mask_idx.size();
+
+    IefcCalibrationResult out;
+    out.response_matrix = Array2D<double>(nprobes * nmask, nmodes, 0.0);
+    out.response_cube.reserve(nmodes);
+    out.nprobes = nprobes;
+    out.ncamsci = ncam;
+
+    for (std::size_t m = 0; m < nmodes; ++m) {
+        Array2D<double> dm_mode(nact, nact, 0.0);
+        for (std::size_t r = 0; r < nact; ++r) {
+            for (std::size_t c = 0; c < nact; ++c) {
+                dm_mode(r, c) = calibration_modes(m, r * nact + c);
+            }
+        }
+
+        const double amp = calibration_amplitude *
+            (scale_factors.empty() ? 1.0 : scale_factors[m]);
+        if (amp == 0.0) {
+            throw std::invalid_argument("effective calibration amplitude cannot be zero");
+        }
+
+        Array2D<double> response(nprobes, ncam * ncam, 0.0);
+        for (int s : {1, -1}) {
+            Array2D<double> base = base0;
+            for (std::size_t idx = 0; idx < base.size(); ++idx) {
+                base.data()[idx] += static_cast<double>(s) * amp * dm_mode.data()[idx];
+            }
+
+            const Array2D<double> probed = measure_probe_response_control_model(
+                model,
+                base,
+                probe_modes,
+                probe_amplitude,
+                ncam * ncam,
+                use_vortex,
+                imax_ref);
+
+            const double coeff = static_cast<double>(s) / (2.0 * amp);
+            for (std::size_t idx = 0; idx < response.size(); ++idx) {
+                response.data()[idx] += coeff * probed.data()[idx];
+            }
+        }
+
+        out.response_cube.push_back(response);
+        for (std::size_t p = 0; p < nprobes; ++p) {
+            for (std::size_t k = 0; k < nmask; ++k) {
+                out.response_matrix(p * nmask + k, m) = response(p, mask_idx[k]);
+            }
+        }
+
+        if (progress) {
+            progress(m + 1, nmodes);
+        }
+    }
+
+    return out;
 }
 
 void run(IefcData& iefc_data,

@@ -6,8 +6,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <stdexcept>
 #include <string>
+
+#ifdef LINA_USE_LBFGS
+#include <lbfgs.h>
+#endif
+
+#ifdef LINA_USE_OPENBLAS
+#include <cblas.h>
+#endif
 
 namespace lina {
 namespace {
@@ -188,7 +197,7 @@ ControlModel::ControlModel(double wavelength_c,
     for (std::size_t i = 0; i < inf_fun_.size(); ++i) {
         inf_fun_c.data()[i] = inf_fun_.data()[i];
     }
-    inf_fun_fft_ = fft(inf_fun_c);
+    inf_fun_fft_ = fft_backend(inf_fun_c);
 
     const auto xc = linspace(-static_cast<double>(nact_) / 2.0,
                              static_cast<double>(nact_) / 2.0 - 1.0,
@@ -252,22 +261,143 @@ ControlModel::ControlModel(double wavelength_c,
     }
 }
 
+void ControlModel::set_device(const std::string& device) {
+    if (device == "cpu") {
+        use_gpu_ = false;
+    } else if (device == "gpu") {
+        // Probe once so users get an immediate clear error if CUDA is unavailable.
+        Array2D<std::complex<double>> probe(2, 2, {0.0, 0.0});
+        (void)fft_gpu(probe);
+        use_gpu_ = true;
+    } else {
+        throw std::invalid_argument("device must be 'cpu' or 'gpu'");
+    }
+
+    // Rebuild backend-dependent cached FFT so subsequent calls stay on the
+    // selected compute path -- unless the DM model was supplied externally
+    // (in which case inf_fun_fft_ is reference data, not backend-dependent).
+    if (!dm_model_external_) {
+        Array2D<std::complex<double>> inf_fun_c(nsurf_, nsurf_, {0.0, 0.0});
+        for (std::size_t i = 0; i < inf_fun_.size(); ++i) {
+            inf_fun_c.data()[i] = inf_fun_.data()[i];
+        }
+        inf_fun_fft_ = fft_backend(inf_fun_c);
+    }
+}
+
+Array2D<std::complex<double>> ControlModel::fft_backend(
+    const Array2D<std::complex<double>>& arr) const {
+    return use_gpu_ ? fft_gpu(arr) : fft(arr);
+}
+
+Array2D<std::complex<double>> ControlModel::ifft_backend(
+    const Array2D<std::complex<double>>& arr) const {
+    return use_gpu_ ? ifft_gpu(arr) : ifft(arr);
+}
+
+Array2D<std::complex<double>> ControlModel::ang_spec_backend(
+    const Array2D<std::complex<double>>& wavefront,
+    double wavelength,
+    double distance,
+    double pixelscale) const {
+    return use_gpu_
+               ? ang_spec_gpu(wavefront, wavelength, distance, pixelscale)
+               : ang_spec(wavefront, wavelength, distance, pixelscale);
+}
+
+Array2D<std::complex<double>> ControlModel::mft_forward_backend(
+    const Array2D<std::complex<double>>& wavefront,
+    double npix,
+    std::size_t npsf,
+    double psf_pixelscale_lamD,
+    char convention,
+    const char* pp_centering,
+    const char* fp_centering) const {
+    if (!use_gpu_) {
+        return mft_forward(
+            wavefront, npix, npsf, psf_pixelscale_lamD,
+            convention, pp_centering, fp_centering);
+    }
+
+    try {
+        return mft_forward_gpu(
+            wavefront, npix, npsf, psf_pixelscale_lamD,
+            convention, pp_centering, fp_centering);
+    } catch (const std::exception& err) {
+        const std::string msg = err.what();
+        if (msg.find("cublasZgemm failed") == std::string::npos) {
+            throw;
+        }
+        // Retry once for transient cuBLAS failures observed on some stacks.
+        return mft_forward_gpu(
+            wavefront, npix, npsf, psf_pixelscale_lamD,
+            convention, pp_centering, fp_centering);
+    }
+}
+
+Array2D<std::complex<double>> ControlModel::mft_reverse_backend(
+    const Array2D<std::complex<double>>& fpwf,
+    double psf_pixelscale_lamD,
+    double npix,
+    std::size_t N,
+    char convention,
+    const char* pp_centering,
+    const char* fp_centering) const {
+    if (!use_gpu_) {
+        return mft_reverse(
+            fpwf, psf_pixelscale_lamD, npix, N,
+            convention, pp_centering, fp_centering);
+    }
+
+    try {
+        return mft_reverse_gpu(
+            fpwf, psf_pixelscale_lamD, npix, N,
+            convention, pp_centering, fp_centering);
+    } catch (const std::exception& err) {
+        const std::string msg = err.what();
+        if (msg.find("cublasZgemm failed") == std::string::npos) {
+            throw;
+        }
+        // Retry once for transient cuBLAS failures observed on some stacks.
+        return mft_reverse_gpu(
+            fpwf, psf_pixelscale_lamD, npix, N,
+            convention, pp_centering, fp_centering);
+    }
+}
+
 Array2D<std::complex<double>> ControlModel::matmul(
     const Array2D<std::complex<double>>& a,
     const Array2D<std::complex<double>>& b) const {
     if (a.cols() != b.rows()) {
         throw std::invalid_argument("complex matmul dimension mismatch");
     }
-    Array2D<std::complex<double>> out(a.rows(), b.cols(), {0.0, 0.0});
-    for (std::size_t r = 0; r < a.rows(); ++r) {
-        for (std::size_t c = 0; c < b.cols(); ++c) {
+    const std::size_t m = a.rows();
+    const std::size_t k = a.cols();
+    const std::size_t n = b.cols();
+    Array2D<std::complex<double>> out(m, n, {0.0, 0.0});
+
+#ifdef LINA_USE_OPENBLAS
+    // BLAS complex GEMM (row-major). std::complex<double> is layout-compatible
+    // with the two-double representation CBLAS expects. This is ~50x faster
+    // than the naive triple loop for the nsurf-sized DM-model matrices.
+    const std::complex<double> alpha(1.0, 0.0);
+    const std::complex<double> beta(0.0, 0.0);
+    cblas_zgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                &alpha, a.data(), static_cast<int>(k),
+                b.data(), static_cast<int>(n),
+                &beta, out.data(), static_cast<int>(n));
+#else
+    for (std::size_t r = 0; r < m; ++r) {
+        for (std::size_t c = 0; c < n; ++c) {
             std::complex<double> sum(0.0, 0.0);
-            for (std::size_t k = 0; k < a.cols(); ++k) {
-                sum += a(r, k) * b(k, c);
+            for (std::size_t kk = 0; kk < k; ++kk) {
+                sum += a(r, kk) * b(kk, c);
             }
             out(r, c) = sum;
         }
     }
+#endif
     return out;
 }
 
@@ -292,7 +422,7 @@ ControlModel::ForwardResult ControlModel::forward_internal(const std::vector<dou
     for (std::size_t i = 0; i < fourier_surf.size(); ++i) {
         fourier_surf.data()[i] = inf_fun_fft_.data()[i] * mft_command.data()[i];
     }
-    Array2D<std::complex<double>> dm_surf_c = ifft(fourier_surf);
+    Array2D<std::complex<double>> dm_surf_c = ifft_backend(fourier_surf);
     Array2D<double> dm_surf(nsurf_, nsurf_, 0.0);
     for (std::size_t i = 0; i < dm_surf.size(); ++i) {
         dm_surf.data()[i] = dm_surf_c.data()[i].real();
@@ -324,19 +454,19 @@ ControlModel::ForwardResult ControlModel::forward_internal(const std::vector<dou
     Array2D<std::complex<double>> e_lp(ndef_, ndef_, {0.0, 0.0});
     if (use_vortex) {
         Array2D<std::complex<double>> e_dm_lres = pad_or_crop(e_dm, n_vortex_lres_);
-        Array2D<std::complex<double>> e_fpm_lres = fft(e_dm_lres);
+        Array2D<std::complex<double>> e_fpm_lres = fft_backend(e_dm_lres);
         for (std::size_t i = 0; i < e_fpm_lres.size(); ++i) {
             e_fpm_lres.data()[i] *= windowed_vortex_lres_.data()[i];
         }
-        Array2D<std::complex<double>> e_lp_lres = ifft(e_fpm_lres);
+        Array2D<std::complex<double>> e_lp_lres = ifft_backend(e_fpm_lres);
         e_lp_lres = pad_or_crop(e_lp_lres, ndef_);
 
-        Array2D<std::complex<double>> e_fpm_hres = mft_forward(
+        Array2D<std::complex<double>> e_fpm_hres = mft_forward_backend(
             e_dm, npix_, n_vortex_hres_, hres_sampling_, '-', "odd", "odd");
         for (std::size_t i = 0; i < e_fpm_hres.size(); ++i) {
             e_fpm_hres.data()[i] *= windowed_vortex_hres_.data()[i];
         }
-        Array2D<std::complex<double>> e_lp_hres = mft_reverse(
+        Array2D<std::complex<double>> e_lp_hres = mft_reverse_backend(
             e_fpm_hres, hres_sampling_, npix_, ndef_, '+', "odd", "odd");
 
         for (std::size_t i = 0; i < e_lp.size(); ++i) {
@@ -354,12 +484,16 @@ ControlModel::ForwardResult ControlModel::forward_internal(const std::vector<dou
     Array2D<std::complex<double>> e_fffp = e_ls;
     if (exit_pupil_prop_dist_.has_value()) {
         Array2D<std::complex<double>> e_ls_pad = pad_or_crop(e_ls, 2 * ndef_);
-        e_fffp = ang_spec(e_ls_pad, wavelength, exit_pupil_prop_dist_.value(), exit_pupil_pxscl_);
+        e_fffp = ang_spec_backend(
+            e_ls_pad, wavelength, exit_pupil_prop_dist_.value(), exit_pupil_pxscl_);
     }
 
     const double camsci_pxscl_lamD = camsci_pxscl_lamDc_ * wavelength_c_ / wavelength;
-    Array2D<std::complex<double>> e_fp = mft_forward(
-        e_fffp, static_cast<std::size_t>(npix_ * lyot_ratio_), ncamsci_, camsci_pxscl_lamD, '-', "odd", "odd");
+    // npix here is a sampling scale (dx = 1/npix), not an array size, so keep
+    // it fractional to match the Python reference (npix * lyot_ratio).
+    Array2D<std::complex<double>> e_fp = mft_forward_backend(
+        e_fffp, static_cast<double>(npix_) * lyot_ratio_, ncamsci_,
+        camsci_pxscl_lamD, '-', "odd", "odd");
 
     if (camsci_rotation_ != 0.0) {
         e_fp = rotate_bilinear(e_fp, camsci_rotation_);
@@ -370,7 +504,282 @@ ControlModel::ForwardResult ControlModel::forward_internal(const std::vector<dou
 Array2D<std::complex<double>> ControlModel::forward(const std::vector<double>& actuators,
                                                     double wavelength,
                                                     bool use_vortex) {
+#ifdef LINA_USE_CUDA
+    if (use_gpu_) {
+        // Device-resident pipeline: all intermediates stay on the GPU,
+        // only the focal-plane field is copied back to the host.
+        return control_model_forward_gpu(*this, actuators, wavelength, use_vortex);
+    }
+#endif
     return forward_internal(actuators, wavelength, use_vortex).e_fp;
+}
+
+void ControlModel::set_prefpm_amp(const Array2D<double>& amp) {
+    if (amp.rows() != ndef_ || amp.cols() != ndef_) {
+        throw std::invalid_argument("set_prefpm_amp shape mismatch");
+    }
+    prefpm_amp_ = amp;
+}
+
+void ControlModel::set_prefpm_opd(const Array2D<double>& opd) {
+    if (opd.rows() != ndef_ || opd.cols() != ndef_) {
+        throw std::invalid_argument("set_prefpm_opd shape mismatch");
+    }
+    prefpm_opd_ = opd;
+}
+
+void ControlModel::set_aperture(const Array2D<double>& aperture) {
+    if (aperture.rows() != ndef_ || aperture.cols() != ndef_) {
+        throw std::invalid_argument("set_aperture shape mismatch");
+    }
+    aperture_ = aperture;
+    // Invalidate any cached GPU constants so the next forward re-uploads.
+    gpu_state_.reset();
+}
+
+void ControlModel::set_lyotstop(const Array2D<double>& lyotstop) {
+    if (lyotstop.rows() != ndef_ || lyotstop.cols() != ndef_) {
+        throw std::invalid_argument("set_lyotstop shape mismatch");
+    }
+    lyotstop_ = lyotstop;
+    gpu_state_.reset();
+}
+
+void ControlModel::set_windowed_vortex_lres(const Array2D<std::complex<double>>& m) {
+    if (m.rows() != n_vortex_lres_ || m.cols() != n_vortex_lres_) {
+        throw std::invalid_argument("set_windowed_vortex_lres shape mismatch");
+    }
+    windowed_vortex_lres_ = m;
+    gpu_state_.reset();
+}
+
+void ControlModel::set_windowed_vortex_hres(const Array2D<std::complex<double>>& m) {
+    if (m.rows() != n_vortex_hres_ || m.cols() != n_vortex_hres_) {
+        throw std::invalid_argument("set_windowed_vortex_hres shape mismatch");
+    }
+    windowed_vortex_hres_ = m;
+    gpu_state_.reset();
+}
+
+void ControlModel::set_dm_model(const Array2D<std::complex<double>>& inf_fun_fft,
+                                const Array2D<std::complex<double>>& mx_dm,
+                                const Array2D<std::complex<double>>& my_dm,
+                                const Array2D<std::complex<double>>& mx_dm_back,
+                                const Array2D<std::complex<double>>& my_dm_back) {
+    if (inf_fun_fft.rows() != nsurf_ || inf_fun_fft.cols() != nsurf_) {
+        throw std::invalid_argument("set_dm_model: inf_fun_fft shape mismatch");
+    }
+    if (mx_dm.rows() != nsurf_ || mx_dm.cols() != nact_ ||
+        my_dm.rows() != nact_ || my_dm.cols() != nsurf_ ||
+        mx_dm_back.rows() != nact_ || mx_dm_back.cols() != nsurf_ ||
+        my_dm_back.rows() != nsurf_ || my_dm_back.cols() != nact_) {
+        throw std::invalid_argument("set_dm_model: DM matrix shape mismatch");
+    }
+    inf_fun_fft_ = inf_fun_fft;
+    mx_dm_ = mx_dm;
+    my_dm_ = my_dm;
+    mx_dm_back_ = mx_dm_back;
+    my_dm_back_ = my_dm_back;
+    dm_model_external_ = true;
+    gpu_state_.reset();
+}
+
+double dm_val_and_grad(const ControlModel& model,
+                       const std::vector<double>& del_acts,
+                       const Array2D<double>& opd,
+                       std::vector<double>& grad_out) {
+    const std::size_t nact = model.nact_;
+    const std::size_t nsurf = model.nsurf_;
+    const std::size_t ndef = opd.rows();
+    if (opd.cols() != ndef) {
+        throw std::invalid_argument("dm_val_and_grad expects square OPD");
+    }
+
+    // del_command (nact x nact) from the masked actuator vector.
+    Array2D<std::complex<double>> dm_command_c(nact, nact, {0.0, 0.0});
+    std::size_t idx = 0;
+    for (std::size_t i = 0; i < model.dm_mask_.size(); ++i) {
+        if (model.dm_mask_.data()[i]) {
+            dm_command_c.data()[i] = del_acts[idx++];
+        }
+    }
+
+    // dm_surf = Re( ifft( inf_fun_fft * (Mx_dm @ dm_command @ My_dm) ) )
+    // Use the CPU FFT here: this is a small (nsurf^2) one-time flat-DM solve,
+    // and the CPU path avoids the per-call GPU host<->device round-trips that
+    // dominate runtime when this is driven by an optimizer (hundreds of evals).
+    // Numerically identical to the GPU FFT to ~1e-12.
+    const auto mft_command = model.matmul(model.matmul(model.mx_dm_, dm_command_c), model.my_dm_);
+    Array2D<std::complex<double>> fourier_surf(nsurf, nsurf, {0.0, 0.0});
+    for (std::size_t i = 0; i < fourier_surf.size(); ++i) {
+        fourier_surf.data()[i] = model.inf_fun_fft_.data()[i] * mft_command.data()[i];
+    }
+    Array2D<std::complex<double>> dm_surf_c = ifft(fourier_surf);
+    Array2D<double> dm_surf(nsurf, nsurf, 0.0);
+    for (std::size_t i = 0; i < dm_surf.size(); ++i) {
+        dm_surf.data()[i] = dm_surf_c.data()[i].real();
+    }
+    Array2D<double> dm_surf_pad = pad_or_crop(dm_surf, ndef);
+
+    // Beam-aperture mask = aperture > 0 (already ndef x ndef).
+    const Array2D<double>& ap = model.aperture_;
+
+    double opd_l2norm = 0.0;
+    for (std::size_t i = 0; i < opd.size(); ++i) {
+        if (ap.data()[i] > 0.0) {
+            const double v = opd.data()[i];
+            opd_l2norm += v * v;
+        }
+    }
+    if (opd_l2norm == 0.0) {
+        opd_l2norm = 1.0;
+    }
+
+    double j_num = 0.0;
+    Array2D<double> total_opd(ndef, ndef, 0.0);
+    for (std::size_t i = 0; i < opd.size(); ++i) {
+        const double t = opd.data()[i] + 2.0 * dm_surf_pad.data()[i];
+        total_opd.data()[i] = t;
+        if (ap.data()[i] > 0.0) {
+            j_num += t * t;
+        }
+    }
+    const double J = j_num / opd_l2norm;
+
+    // dJ/dOPD = 2 * mask * total_opd / opd_l2norm
+    Array2D<double> dJ_dOPD(ndef, ndef, 0.0);
+    for (std::size_t i = 0; i < opd.size(); ++i) {
+        if (ap.data()[i] > 0.0) {
+            dJ_dOPD.data()[i] = 2.0 * total_opd.data()[i] / opd_l2norm;
+        }
+    }
+
+    // Back-propagate to actuators (adjoint of the forward DM-surface model).
+    Array2D<double> dJ_dS_DM = pad_or_crop(dJ_dOPD, nsurf);
+    Array2D<std::complex<double>> dJ_dS_DM_c(nsurf, nsurf, {0.0, 0.0});
+    for (std::size_t i = 0; i < dJ_dS_DM.size(); ++i) {
+        dJ_dS_DM_c.data()[i] = dJ_dS_DM.data()[i];
+    }
+    Array2D<std::complex<double>> x2_bar = fft(dJ_dS_DM_c);
+    Array2D<std::complex<double>> x1_bar(nsurf, nsurf, {0.0, 0.0});
+    for (std::size_t i = 0; i < x1_bar.size(); ++i) {
+        x1_bar.data()[i] = std::conj(model.inf_fun_fft_.data()[i]) * x2_bar.data()[i];
+    }
+    Array2D<std::complex<double>> dJ_dA1 =
+        model.matmul(model.matmul(model.mx_dm_back_, x1_bar), model.my_dm_back_);
+    const double norm = static_cast<double>(nsurf * nact * nact);
+
+    grad_out.assign(model.nacts_, 0.0);
+    std::size_t act_idx = 0;
+    for (std::size_t i = 0; i < model.dm_mask_.size(); ++i) {
+        if (model.dm_mask_.data()[i]) {
+            grad_out[act_idx++] = dJ_dA1.data()[i].real() / norm;
+        }
+    }
+    return J;
+}
+
+namespace {
+
+using ObjFn = std::function<double(const std::vector<double>&, std::vector<double>&)>;
+
+double dot(const std::vector<double>& a, const std::vector<double>& b) {
+    double s = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) s += a[i] * b[i];
+    return s;
+}
+
+double inf_norm(const std::vector<double>& v) {
+    double m = 0.0;
+    for (double x : v) m = std::max(m, std::abs(x));
+    return m;
+}
+
+// ---------------------------------------------------------------------------
+// Linear conjugate gradient for the (convex, quadratic) flat-DM objective.
+//
+// J(x) is quadratic in the actuators, so its gradient is affine:
+//     grad(x) = A x - b   (A symmetric PSD).
+// Linear CG is the natural, parameter-free solver here: starting from x = 0 it
+// converges to the minimum-norm solution within the Krylov subspace and never
+// excites the degenerate (zero-curvature) directions that make a generic
+// L-BFGS line search drift into large, meaningless actuator strokes. This
+// reproduces SciPy L-BFGS-B's well-behaved (small-stroke) solution.
+//
+// We need only the gradient oracle: A d = grad(x + d) - grad(x), evaluated via
+// one extra objective call per iteration. Any uniform scaling of grad (the
+// analytic objective returns a consistently scaled gradient) leaves the
+// solution unchanged, since CG then solves (sA) x = (s b) <=> A x = b.
+// ---------------------------------------------------------------------------
+std::vector<double> cg_minimize(std::size_t n,
+                                const ObjFn& objective,
+                                double gtol,
+                                int max_iter) {
+    if (max_iter <= 0) max_iter = static_cast<int>(n) + 50;
+
+    std::vector<double> x(n, 0.0);
+    std::vector<double> g(n, 0.0);
+    (void)objective(x, g);          // g = grad(0) = -b (up to scale)
+
+    // Relative gradient stop: the flat-DM objective's analytic gradient is a
+    // (consistent) constant scaling of the true gradient, so an absolute
+    // threshold is meaningless. Stop when the gradient inf-norm has dropped by
+    // `gtol` relative to its initial value (default 1e-4 -> 4 orders), which
+    // captures the well-observed DM modes and ignores the degenerate tail.
+    const double g0 = std::max(inf_norm(g), 1e-300);
+    const double grad_stop = gtol * g0;
+
+    std::vector<double> r(n, 0.0);  // residual = -grad(x)
+    for (std::size_t i = 0; i < n; ++i) r[i] = -g[i];
+    std::vector<double> d = r;
+    double rs_old = dot(r, r);
+
+    std::vector<double> x_trial(n, 0.0), g_trial(n, 0.0), Ad(n, 0.0);
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        if (inf_norm(g) <= grad_stop) break;
+
+        // A d = grad(x + d) - grad(x).
+        for (std::size_t i = 0; i < n; ++i) x_trial[i] = x[i] + d[i];
+        (void)objective(x_trial, g_trial);
+        for (std::size_t i = 0; i < n; ++i) Ad[i] = g_trial[i] - g[i];
+
+        const double dAd = dot(d, Ad);
+        if (!(dAd > 0.0)) break;  // no positive curvature left (degenerate)
+
+        const double alpha = rs_old / dAd;
+        for (std::size_t i = 0; i < n; ++i) {
+            x[i] += alpha * d[i];
+            r[i] -= alpha * Ad[i];
+            g[i] = -r[i];           // grad(x) updated consistently
+        }
+
+        if (inf_norm(g) <= grad_stop) break;
+        const double rs_new = dot(r, r);
+        const double beta = rs_new / rs_old;
+        for (std::size_t i = 0; i < n; ++i) d[i] = r[i] + beta * d[i];
+        rs_old = rs_new;
+    }
+    return x;
+}
+
+} // namespace
+
+std::vector<double> solve_flat_command(const ControlModel& model,
+                                       const Array2D<double>& opd,
+                                       double tol,
+                                       int max_iter) {
+    // The flat-DM objective is a convex quadratic in the actuators, so linear
+    // conjugate gradient is the natural solver: it is parameter-free, invariant
+    // to the constant scaling of the analytic gradient, converges to the
+    // minimum-norm (small-stroke) solution that matches SciPy L-BFGS-B, and
+    // avoids the line-search fragility of a generic quasi-Newton method on a
+    // dimensionally-tiny, ill-conditioned problem.
+    const std::size_t n = model.nacts();
+    auto objective = [&](const std::vector<double>& x, std::vector<double>& grad) -> double {
+        return dm_val_and_grad(model, x, opd, grad);
+    };
+    return cg_minimize(n, objective, tol, max_iter);
 }
 
 double val_and_grad(const std::vector<double>& del_acts,
@@ -438,14 +847,16 @@ double val_and_grad(const std::vector<double>& del_acts,
     }
 
     const double camsci_pxscl_lamD = model.camsci_pxscl_lamDc_ * model.wavelength_c_ / wavelength;
-    Array2D<std::complex<double>> dJ_dE_FFFP = mft_reverse(
-        dJ_ddeltaE, camsci_pxscl_lamD, static_cast<std::size_t>(model.npix_ * model.lyot_ratio_),
+    Array2D<std::complex<double>> dJ_dE_FFFP = model.mft_reverse_backend(
+        dJ_ddeltaE, camsci_pxscl_lamD,
+        static_cast<double>(model.npix_) * model.lyot_ratio_,
         2 * model.ndef_, '+', "odd", "odd");
 
     Array2D<std::complex<double>> dJ_dE_LS = dJ_dE_FFFP;
     if (model.exit_pupil_prop_dist_.has_value()) {
-        dJ_dE_LS = ang_spec(dJ_dE_FFFP, wavelength, -model.exit_pupil_prop_dist_.value(),
-                            model.exit_pupil_pxscl_);
+        dJ_dE_LS = model.ang_spec_backend(
+            dJ_dE_FFFP, wavelength, -model.exit_pupil_prop_dist_.value(),
+            model.exit_pupil_pxscl_);
         dJ_dE_LS = pad_or_crop(dJ_dE_LS, model.ndef_);
     } else {
         dJ_dE_LS = pad_or_crop(dJ_dE_LS, model.ndef_);
@@ -457,17 +868,17 @@ double val_and_grad(const std::vector<double>& del_acts,
     }
 
     Array2D<std::complex<double>> dJ_dE_LP_fft = pad_or_crop(dJ_dE_LP, model.n_vortex_lres_);
-    Array2D<std::complex<double>> dJ_dE_FPM_fft = fft(dJ_dE_LP_fft);
+    Array2D<std::complex<double>> dJ_dE_FPM_fft = model.fft_backend(dJ_dE_LP_fft);
     Array2D<std::complex<double>> dJ_dE_FP_fft(dJ_dE_FPM_fft.rows(), dJ_dE_FPM_fft.cols(), {0.0, 0.0});
     for (std::size_t i = 0; i < dJ_dE_FP_fft.size(); ++i) {
         dJ_dE_FP_fft.data()[i] =
             std::conj(model.vortex_lres_.data()[i]) * (1.0 - model.lres_window_.data()[i]) *
             dJ_dE_FPM_fft.data()[i];
     }
-    Array2D<std::complex<double>> dJ_dE_PUP_fft = ifft(dJ_dE_FP_fft);
+    Array2D<std::complex<double>> dJ_dE_PUP_fft = model.ifft_backend(dJ_dE_FP_fft);
     dJ_dE_PUP_fft = pad_or_crop(dJ_dE_PUP_fft, model.ndef_);
 
-    Array2D<std::complex<double>> dJ_dE_FPM_mft = mft_forward(
+    Array2D<std::complex<double>> dJ_dE_FPM_mft = model.mft_forward_backend(
         dJ_dE_LP, model.npix_, model.n_vortex_hres_, model.hres_sampling_, '-', "odd", "odd");
     Array2D<std::complex<double>> dJ_dE_FP_mft(dJ_dE_FPM_mft.rows(), dJ_dE_FPM_mft.cols(), {0.0, 0.0});
     for (std::size_t i = 0; i < dJ_dE_FP_mft.size(); ++i) {
@@ -475,7 +886,7 @@ double val_and_grad(const std::vector<double>& del_acts,
             std::conj(model.vortex_hres_.data()[i]) * model.hres_window_.data()[i] *
             model.hres_dot_mask_.data()[i] * dJ_dE_FPM_mft.data()[i];
     }
-    Array2D<std::complex<double>> dJ_dE_PUP_mft = mft_reverse(
+    Array2D<std::complex<double>> dJ_dE_PUP_mft = model.mft_reverse_backend(
         dJ_dE_FP_mft, model.hres_sampling_, model.npix_, model.ndef_, '+', "odd", "odd");
 
     Array2D<std::complex<double>> dJ_dE_PUP(dJ_dE_PUP_fft.rows(), dJ_dE_PUP_fft.cols(), {0.0, 0.0});
@@ -497,7 +908,7 @@ double val_and_grad(const std::vector<double>& del_acts,
     for (std::size_t i = 0; i < dJ_dS_DM_pad.size(); ++i) {
         dJ_dS_DM_c.data()[i] = dJ_dS_DM_pad.data()[i];
     }
-    Array2D<std::complex<double>> x2_bar = fft(dJ_dS_DM_c);
+    Array2D<std::complex<double>> x2_bar = model.fft_backend(dJ_dS_DM_c);
     Array2D<std::complex<double>> x1_bar(model.nsurf_, model.nsurf_, {0.0, 0.0});
     for (std::size_t i = 0; i < x1_bar.size(); ++i) {
         x1_bar.data()[i] = std::conj(model.inf_fun_fft_.data()[i]) * x2_bar.data()[i];

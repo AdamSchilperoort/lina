@@ -42,6 +42,17 @@ struct SvdCalibrationResult {
 };
 
 SvdResult svd(const Array2D<double>& a);
+// Economy ("thin") SVD: u is m x k and vt is k x n with k = min(m, n).
+// Avoids the O(m^2) full-U allocation of svd(), which is catastrophic for
+// tall matrices (e.g. least-squares over a flattened image: m ~ 1e5).
+SvdResult svd_thin(const Array2D<double>& a);
+
+// Beta-regularised control-matrix inverse, native CUDA:
+//   control = inv(S^T S + alpha2 * 10^beta * I) @ S^T,  alpha2 = max diag(S^T S)
+// Computed entirely on the GPU (cuBLAS GEMM + cuSOLVER Cholesky solve). S is
+// (m x n) row-major; the returned control matrix is (n x m). Only the input
+// upload and output download cross the PCIe bus.
+Array2D<double> beta_reg_gpu(const Array2D<double>& S, double beta);
 SvdResultF svd_float(const Array2D<float>& a);
 SvdResultF svd_float_cpu(const Array2D<float>& a);
 SvdResultF svd_float_gpu(const Array2D<float>& a);

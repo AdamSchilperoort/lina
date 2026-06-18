@@ -1,9 +1,0 @@
-# Build artifacts from `pip install -e .` and from setuptools / CMake
-build/
-dist/
-*.egg-info/
-*.cpython-*.so
-
-# Python bytecode
-__pycache__/
-*.pyc

@@ -244,7 +244,7 @@ endif()
 
 if(LINA_USE_CUDA)
     find_package(CUDAToolkit REQUIRED)
-    add_library(lina_cuda src/linalg_cuda.cu src/props_cuda.cu)
+    add_library(lina_cuda src/linalg_cuda.cu src/props_cuda.cu src/control_models_cuda.cu)
     target_include_directories(lina_cuda PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>

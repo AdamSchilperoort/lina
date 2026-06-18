@@ -5,7 +5,10 @@
 #include <pybind11/stl.h>
 
 #include <complex>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -30,6 +33,24 @@ lina::Array2D<T> array2d_from_numpy(
     const auto cols = static_cast<std::size_t>(info.shape[1]);
     lina::Array2D<T> out(rows, cols, T{});
     std::memcpy(out.data(), info.ptr, sizeof(T) * rows * cols);
+    return out;
+}
+
+template <typename T>
+lina::Array2D<T> modes_array2d_from_numpy(
+    const py::array_t<T, py::array::c_style | py::array::forcecast>& arr) {
+    const auto info = arr.request();
+    if (info.ndim == 2) {
+        return array2d_from_numpy<T>(arr);
+    }
+    if (info.ndim != 3) {
+        throw std::runtime_error("Expected 2D (flattened) or 3D (cube) array");
+    }
+    const auto nmodes = static_cast<std::size_t>(info.shape[0]);
+    const auto d1 = static_cast<std::size_t>(info.shape[1]);
+    const auto d2 = static_cast<std::size_t>(info.shape[2]);
+    lina::Array2D<T> out(nmodes, d1 * d2, T{});
+    std::memcpy(out.data(), info.ptr, sizeof(T) * nmodes * d1 * d2);
     return out;
 }
 
@@ -105,7 +126,7 @@ py::array_t<std::complex<double>> get_fresnel_TF_gpu_wrapper(
 
 py::array_t<std::complex<double>> mft_forward_gpu_wrapper(
     py::array_t<std::complex<double>> input,
-    std::size_t npix, std::size_t npsf, double psf_pixelscale_lamD,
+    double npix, std::size_t npsf, double psf_pixelscale_lamD,
     const std::string& convention,
     const std::string& pp_centering,
     const std::string& fp_centering) {
@@ -118,7 +139,7 @@ py::array_t<std::complex<double>> mft_forward_gpu_wrapper(
 
 py::array_t<std::complex<double>> mft_reverse_gpu_wrapper(
     py::array_t<std::complex<double>> input,
-    double psf_pixelscale_lamD, std::size_t npix, std::size_t N,
+    double psf_pixelscale_lamD, double npix, std::size_t N,
     const std::string& convention,
     const std::string& pp_centering,
     const std::string& fp_centering) {
@@ -220,7 +241,7 @@ py::array_t<std::complex<double>> make_vortex_phase_mask_wrapper(std::size_t npi
 }
 
 py::array_t<std::complex<double>> mft_forward_wrapper(py::array_t<std::complex<double>> input,
-                                                      std::size_t npix,
+                                                      double npix,
                                                       std::size_t npsf,
                                                       double psf_pixelscale_lamD,
                                                       const std::string& convention,
@@ -234,7 +255,7 @@ py::array_t<std::complex<double>> mft_forward_wrapper(py::array_t<std::complex<d
 
 py::array_t<std::complex<double>> mft_reverse_wrapper(py::array_t<std::complex<double>> input,
                                                       double psf_pixelscale_lamD,
-                                                      std::size_t npix,
+                                                      double npix,
                                                       std::size_t N,
                                                       const std::string& convention,
                                                       const std::string& pp_centering,
@@ -379,6 +400,161 @@ py::array_t<double> gemv_wrapper(py::array_t<double> a,
     auto A = array2d_from_numpy<double>(a);
     auto xv = vector_from_numpy<double>(x);
     return numpy_from_vector(lina::gemv(A, xv, transpose_a));
+}
+
+py::array_t<double> lstsq_wrapper(
+    py::array_t<double, py::array::c_style | py::array::forcecast> modes,
+    py::array_t<double, py::array::c_style | py::array::forcecast> data) {
+    const auto m_info = modes.request();
+    const auto d_info = data.request();
+    if (m_info.ndim < 2) {
+        throw std::runtime_error("modes must have at least 2 dimensions");
+    }
+    const std::size_t nmodes = static_cast<std::size_t>(m_info.shape[0]);
+    std::size_t npoints = 1;
+    for (int i = 1; i < m_info.ndim; ++i) {
+        npoints *= static_cast<std::size_t>(m_info.shape[i]);
+    }
+    if (static_cast<std::size_t>(d_info.size) != npoints) {
+        throw std::runtime_error("modes/data size mismatch in lstsq");
+    }
+
+    const double* m_ptr = static_cast<const double*>(m_info.ptr);
+    const double* d_ptr = static_cast<const double*>(d_info.ptr);
+
+    std::size_t nvalid = 0;
+    for (std::size_t j = 0; j < npoints; ++j) {
+        if (std::isfinite(d_ptr[j])) {
+            ++nvalid;
+        }
+    }
+    if (nvalid == 0) {
+        return numpy_from_vector(std::vector<double>(nmodes, 0.0));
+    }
+
+    lina::Array2D<double> A(nvalid, nmodes, 0.0);
+    std::vector<double> b(nvalid, 0.0);
+    std::size_t row = 0;
+    for (std::size_t j = 0; j < npoints; ++j) {
+        if (!std::isfinite(d_ptr[j])) continue;
+        b[row] = d_ptr[j];
+        for (std::size_t k = 0; k < nmodes; ++k) {
+            A(row, k) = m_ptr[k * npoints + j];
+        }
+        ++row;
+    }
+
+    const auto svd = lina::svd_thin(A);
+    const std::size_t r = svd.s.size();
+    const double smax = r ? *std::max_element(svd.s.begin(), svd.s.end()) : 0.0;
+    const double cutoff = std::numeric_limits<double>::epsilon() *
+                          static_cast<double>(std::max(A.rows(), A.cols())) *
+                          smax;
+
+    std::vector<double> y(r, 0.0);
+    for (std::size_t i = 0; i < r; ++i) {
+        const double si = svd.s[i];
+        if (si <= cutoff) continue;
+        double proj = 0.0;
+        for (std::size_t j = 0; j < A.rows(); ++j) {
+            proj += svd.u(j, i) * b[j];
+        }
+        y[i] = proj / si;
+    }
+
+    std::vector<double> x(nmodes, 0.0);
+    for (std::size_t k = 0; k < nmodes; ++k) {
+        double acc = 0.0;
+        for (std::size_t i = 0; i < r; ++i) {
+            acc += svd.vt(i, k) * y[i];
+        }
+        x[k] = acc;
+    }
+    return numpy_from_vector(x);
+}
+
+py::object tikhonov_inverse_wrapper(
+    py::array_t<double, py::array::c_style | py::array::forcecast> a,
+    double rcond,
+    bool return_all) {
+    auto A = array2d_from_numpy<double>(a);
+    const auto svd = lina::svd_thin(A);
+    const std::size_t m = A.rows();
+    const std::size_t n = A.cols();
+    const std::size_t r = svd.s.size();
+    const double smax = r ? *std::max_element(svd.s.begin(), svd.s.end()) : 0.0;
+    const double alpha = rcond * smax;
+    const double alpha2 = alpha * alpha;
+
+    // P = V diag(s/(s^2+alpha^2)) U^T via BLAS instead of an O(n^2 m) loop.
+    lina::Array2D<double> M(r, m, 0.0);
+    for (std::size_t i = 0; i < r; ++i) {
+        const double si = svd.s[i];
+        const double denom = si * si + alpha2;
+        const double coeff = (denom > 0.0) ? (si / denom) : 0.0;
+        if (coeff == 0.0) continue;
+        for (std::size_t col = 0; col < m; ++col) {
+            M(i, col) = coeff * svd.u(col, i);
+        }
+    }
+    const auto P = lina::gemm(svd.vt, M, /*transpose_a=*/true, /*transpose_b=*/false);
+
+    if (return_all) {
+        return py::make_tuple(
+            numpy_from_array2d(P),
+            numpy_from_array2d(svd.u),
+            numpy_from_vector(svd.s),
+            numpy_from_array2d(svd.vt));
+    }
+    return numpy_from_array2d(P);
+}
+
+py::array_t<double> beta_reg_wrapper(
+    py::array_t<double, py::array::c_style | py::array::forcecast> s,
+    double beta) {
+    const auto S = array2d_from_numpy<double>(s);
+    auto sts = lina::gemm(S, S, true, false);  // S^T S
+    double alpha2 = 0.0;
+    for (std::size_t i = 0; i < sts.rows() && i < sts.cols(); ++i) {
+        alpha2 = std::max(alpha2, sts(i, i));
+    }
+    const double reg = alpha2 * std::pow(10.0, beta);
+    for (std::size_t i = 0; i < sts.rows() && i < sts.cols(); ++i) {
+        sts(i, i) += reg;
+    }
+
+    const auto svd = lina::svd_thin(sts);
+    const std::size_t n = sts.rows();
+    const std::size_t r = svd.s.size();
+    const double smax = r ? *std::max_element(svd.s.begin(), svd.s.end()) : 0.0;
+    const double cutoff = std::numeric_limits<double>::epsilon() *
+                          static_cast<double>(std::max(sts.rows(), sts.cols())) *
+                          smax;
+
+    // Pseudo-inverse inv = V diag(1/s) U^T, computed with BLAS rather than an
+    // O(n^3) triple loop. Build M(i,col) = (1/s_i) * U(col,i) (r x n), then
+    // inv = V @ M = (vt)^T @ M.
+    lina::Array2D<double> M(r, n, 0.0);
+    for (std::size_t i = 0; i < r; ++i) {
+        const double si = svd.s[i];
+        const double coeff = (si > cutoff) ? (1.0 / si) : 0.0;
+        if (coeff == 0.0) continue;
+        for (std::size_t col = 0; col < n; ++col) {
+            M(i, col) = coeff * svd.u(col, i);
+        }
+    }
+    const auto inv = lina::gemm(svd.vt, M, /*transpose_a=*/true, /*transpose_b=*/false);
+
+    // control_matrix = inv(sts + reg*I) @ S^T
+    const auto control = lina::gemm(inv, S, false, true);
+    return numpy_from_array2d(control);
+}
+
+py::array_t<double> beta_reg_gpu_wrapper(
+    py::array_t<double, py::array::c_style | py::array::forcecast> s,
+    double beta) {
+    const auto S = array2d_from_numpy<double>(s);
+    return numpy_from_array2d(lina::beta_reg_gpu(S, beta));
 }
 
 py::tuple svd_wrapper(py::array_t<double> a) {
@@ -601,6 +777,199 @@ py::array_t<double> llowfsc_loop_step_wrapper(
     return numpy_from_array2d(result);
 }
 
+py::array_t<std::complex<double>> control_model_forward_wrapper(
+    lina::ControlModel& model,
+    py::array_t<double, py::array::c_style | py::array::forcecast> actuators,
+    std::optional<double> wavelength,
+    bool use_vortex) {
+    auto acts = vector_from_numpy(actuators);
+    const double wl = wavelength.value_or(model.wavelength());
+    return numpy_from_array2d(model.forward(acts, wl, use_vortex));
+}
+
+py::array_t<std::uint8_t> control_model_dm_mask_wrapper(
+    const lina::ControlModel& model) {
+    return numpy_from_array2d(model.dm_mask());
+}
+
+std::string control_model_device_wrapper(const lina::ControlModel& model) {
+    return model.device();
+}
+
+void control_model_set_device_wrapper(
+    lina::ControlModel& model,
+    const std::string& device) {
+    model.set_device(device);
+}
+
+void control_model_set_prefpm_amp_wrapper(
+    lina::ControlModel& model,
+    py::array_t<double, py::array::c_style | py::array::forcecast> amp) {
+    model.set_prefpm_amp(array2d_from_numpy<double>(amp));
+}
+
+void control_model_set_prefpm_opd_wrapper(
+    lina::ControlModel& model,
+    py::array_t<double, py::array::c_style | py::array::forcecast> opd) {
+    model.set_prefpm_opd(array2d_from_numpy<double>(opd));
+}
+
+void control_model_set_aperture_wrapper(
+    lina::ControlModel& model,
+    py::array_t<double, py::array::c_style | py::array::forcecast> aperture) {
+    model.set_aperture(array2d_from_numpy<double>(aperture));
+}
+
+void control_model_set_lyotstop_wrapper(
+    lina::ControlModel& model,
+    py::array_t<double, py::array::c_style | py::array::forcecast> lyotstop) {
+    model.set_lyotstop(array2d_from_numpy<double>(lyotstop));
+}
+
+void control_model_set_windowed_vortex_lres_wrapper(
+    lina::ControlModel& model,
+    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> m) {
+    model.set_windowed_vortex_lres(array2d_from_numpy<std::complex<double>>(m));
+}
+
+void control_model_set_windowed_vortex_hres_wrapper(
+    lina::ControlModel& model,
+    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> m) {
+    model.set_windowed_vortex_hres(array2d_from_numpy<std::complex<double>>(m));
+}
+
+void control_model_set_dm_model_wrapper(
+    lina::ControlModel& model,
+    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> inf_fun_fft,
+    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> mx_dm,
+    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> my_dm,
+    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> mx_dm_back,
+    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> my_dm_back) {
+    model.set_dm_model(
+        array2d_from_numpy<std::complex<double>>(inf_fun_fft),
+        array2d_from_numpy<std::complex<double>>(mx_dm),
+        array2d_from_numpy<std::complex<double>>(my_dm),
+        array2d_from_numpy<std::complex<double>>(mx_dm_back),
+        array2d_from_numpy<std::complex<double>>(my_dm_back));
+}
+
+py::tuple control_model_dm_val_and_grad_wrapper(
+    lina::ControlModel& model,
+    py::array_t<double, py::array::c_style | py::array::forcecast> del_acts,
+    py::array_t<double, py::array::c_style | py::array::forcecast> opd) {
+    const auto acts = vector_from_numpy<double>(del_acts);
+    const auto opd_arr = array2d_from_numpy<double>(opd);
+    std::vector<double> grad;
+    const double J = lina::dm_val_and_grad(model, acts, opd_arr, grad);
+    return py::make_tuple(J, numpy_from_vector(grad));
+}
+
+py::array_t<double> control_model_solve_flat_wrapper(
+    lina::ControlModel& model,
+    py::array_t<double, py::array::c_style | py::array::forcecast> opd,
+    double tol,
+    int max_iter) {
+    const auto opd_arr = array2d_from_numpy<double>(opd);
+    const auto x = lina::solve_flat_command(model, opd_arr, tol, max_iter);
+    return numpy_from_vector(x);
+}
+
+py::tuple control_model_val_and_grad_wrapper(
+    py::array_t<double, py::array::c_style | py::array::forcecast> del_acts,
+    lina::ControlModel& model,
+    py::array_t<double, py::array::c_style | py::array::forcecast> current_acts,
+    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> e_ab,
+    py::array_t<std::complex<double>, py::array::c_style | py::array::forcecast> e_fp_nom,
+    py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast> control_mask,
+    std::optional<double> wavelength,
+    double r_cond) {
+    auto del = vector_from_numpy(del_acts);
+    auto cur = vector_from_numpy(current_acts);
+    auto eab = array2d_from_numpy<std::complex<double>>(e_ab);
+    auto efp = array2d_from_numpy<std::complex<double>>(e_fp_nom);
+    auto mask = array2d_from_numpy<std::uint8_t>(control_mask);
+    const double wl = wavelength.value_or(model.wavelength());
+
+    std::vector<double> grad;
+    const double J = lina::val_and_grad(
+        del, model, cur, eab, efp, mask, wl, r_cond, grad);
+    return py::make_tuple(J, numpy_from_vector(grad));
+}
+
+py::tuple control_model_iefc_calibrate_wrapper(
+    lina::ControlModel& model,
+    py::array_t<std::uint8_t, py::array::c_style | py::array::forcecast> control_mask,
+    double probe_amplitude,
+    py::array_t<double, py::array::c_style | py::array::forcecast> probe_modes,
+    double calibration_amplitude,
+    py::array_t<double, py::array::c_style | py::array::forcecast> calibration_modes,
+    py::object scale_factors,
+    py::object initial_command,
+    bool use_vortex,
+    double imax_ref,
+    py::object progress_cb) {
+    auto mask = array2d_from_numpy<std::uint8_t>(control_mask);
+    auto probes = modes_array2d_from_numpy<double>(probe_modes);
+    auto modes = modes_array2d_from_numpy<double>(calibration_modes);
+
+    std::vector<double> scales;
+    if (!scale_factors.is_none()) {
+        scales = vector_from_numpy<double>(
+            py::cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(
+                scale_factors));
+    }
+
+    std::optional<lina::Array2D<double>> init_cmd = std::nullopt;
+    if (!initial_command.is_none()) {
+        init_cmd = array2d_from_numpy<double>(
+            py::cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(
+                initial_command));
+    }
+
+    std::function<void(std::size_t, std::size_t)> progress;
+    if (!progress_cb.is_none()) {
+        progress = [progress_cb](std::size_t done, std::size_t total) {
+            // The C++ loop holds the GIL, so calling back into Python is safe.
+            progress_cb(done, total);
+        };
+    }
+
+    const auto res = lina::calibrate_control_model(
+        model,
+        mask,
+        probe_amplitude,
+        probes,
+        calibration_amplitude,
+        modes,
+        scales,
+        init_cmd,
+        use_vortex,
+        imax_ref,
+        progress);
+
+    const auto nmodes = static_cast<py::ssize_t>(res.response_cube.size());
+    const auto nprobes = static_cast<py::ssize_t>(res.nprobes);
+    const auto ncamsci = static_cast<py::ssize_t>(res.ncamsci);
+    py::array_t<double> cube({nmodes, nprobes, ncamsci, ncamsci});
+    auto cube_mut = cube.mutable_unchecked<4>();
+    for (py::ssize_t m = 0; m < nmodes; ++m) {
+        const auto& mode_resp = res.response_cube[static_cast<std::size_t>(m)];
+        for (py::ssize_t p = 0; p < nprobes; ++p) {
+            for (py::ssize_t r = 0; r < ncamsci; ++r) {
+                for (py::ssize_t c = 0; c < ncamsci; ++c) {
+                    cube_mut(m, p, r, c) =
+                        mode_resp(static_cast<std::size_t>(p),
+                                  static_cast<std::size_t>(r * ncamsci + c));
+                }
+            }
+        }
+    }
+
+    return py::make_tuple(
+        numpy_from_array2d(res.response_matrix),
+        cube);
+}
+
 } // namespace
 
 // LINA_PYBIND_MODULE_NAME is set by CMake. It defaults to `lina_cpp` for the
@@ -797,6 +1166,22 @@ PYBIND11_MODULE(LINA_PYBIND_MODULE_NAME, m) {
           py::arg("transpose_a") = false, py::arg("transpose_b") = false);
     m.def("gemv", &gemv_wrapper,
           py::arg("a"), py::arg("x"), py::arg("transpose_a") = false);
+    m.def("lstsq", &lstsq_wrapper,
+          py::arg("modes"), py::arg("data"),
+          "Least-squares projection used by lina.utils.lstsq.");
+    m.def("tikhonov_inverse", &tikhonov_inverse_wrapper,
+          py::arg("a"), py::arg("rcond") = 1e-15,
+          py::arg("return_all") = false,
+          "SVD-based pseudo-inverse with Tikhonov regularization.");
+    m.def("beta_reg", &beta_reg_wrapper,
+          py::arg("S"), py::arg("beta") = -1.0,
+          "Compute beta-regularized control matrix (CPU).");
+#ifdef LINA_USE_CUDA
+    m.def("beta_reg_gpu", &beta_reg_gpu_wrapper,
+          py::arg("S"), py::arg("beta") = -1.0,
+          "Compute beta-regularized control matrix natively on the GPU "
+          "(cuBLAS GEMM + cuSOLVER Cholesky solve).");
+#endif
     m.def("svd", &svd_wrapper, py::arg("a"),
           "SVD (double, full matrices). Returns (U, s, Vt).");
     m.def("svd_float_cpu", &svd_float_cpu_wrapper, py::arg("a"),
@@ -826,4 +1211,92 @@ PYBIND11_MODULE(LINA_PYBIND_MODULE_NAME, m) {
           py::arg("had_modes"), py::arg("scale_exp") = 1.0 / 6.0,
           py::arg("scale_thresh") = 4.0, py::arg("iwa") = 2.5,
           py::arg("owa") = 13.0, py::arg("oversamp") = 4);
+
+    // C++ control model surface (optical simulation backend).
+    py::class_<lina::ControlModel>(m, "ControlModelCpp")
+        .def(py::init<
+                 double, std::optional<double>, std::size_t, std::size_t,
+                 std::size_t, double, double, double, double, double, double,
+                 std::optional<double>, double, std::size_t, std::size_t,
+                 double, double>(),
+             py::arg("wavelength_c") = 630e-9,
+             py::arg("wavelength") = std::nullopt,
+             py::arg("npix") = 500,
+             py::arg("ndef") = 502,
+             py::arg("n_vortex_lres") = 2048,
+             py::arg("vortex_win_diam") = 30.0,
+             py::arg("vortex_hres_sampling") = 0.025,
+             py::arg("vortex_dot_mask_diam_lamDc") = 0.5,
+             py::arg("dm_beam_diam") = 9.3e-3,
+             py::arg("lyot_pupil_diam") = 9.1e-3,
+             py::arg("lyot_stop_diam") = 8.6e-3,
+             py::arg("exit_pupil_prop_dist") = std::nullopt,
+             py::arg("camsci_pxscl_lamDc") = 0.2,
+             py::arg("ncamsci") = 256,
+             py::arg("nact") = 34,
+             py::arg("act_spacing") = 300e-6,
+             py::arg("act_coupling") = 0.15)
+        .def("nacts", &lina::ControlModel::nacts)
+        .def("wavelength", &lina::ControlModel::wavelength)
+        .def("ndef", &lina::ControlModel::ndef)
+        .def("device", &control_model_device_wrapper)
+        .def("set_device", &control_model_set_device_wrapper,
+             py::arg("device"),
+             "Set ControlModel backend: 'cpu' or 'gpu'.")
+        .def("dm_mask", &control_model_dm_mask_wrapper,
+             "Boolean DM mask as uint8 array.")
+        .def("set_prefpm_amp", &control_model_set_prefpm_amp_wrapper,
+             py::arg("amp"),
+             "Set pre-FPM amplitude map (shape ndef x ndef).")
+        .def("set_prefpm_opd", &control_model_set_prefpm_opd_wrapper,
+             py::arg("opd"),
+             "Set pre-FPM OPD map (shape ndef x ndef).")
+        .def("set_aperture", &control_model_set_aperture_wrapper,
+             py::arg("aperture"),
+             "Override entrance-pupil aperture (shape ndef x ndef).")
+        .def("set_lyotstop", &control_model_set_lyotstop_wrapper,
+             py::arg("lyotstop"),
+             "Override Lyot stop mask (shape ndef x ndef).")
+        .def("set_windowed_vortex_lres", &control_model_set_windowed_vortex_lres_wrapper,
+             py::arg("m"),
+             "Override windowed low-res vortex FPM (complex, N_vortex_lres^2).")
+        .def("set_windowed_vortex_hres", &control_model_set_windowed_vortex_hres_wrapper,
+             py::arg("m"),
+             "Override windowed high-res vortex FPM (complex, N_vortex_hres^2).")
+        .def("set_dm_model", &control_model_set_dm_model_wrapper,
+             py::arg("inf_fun_fft"), py::arg("mx_dm"), py::arg("my_dm"),
+             py::arg("mx_dm_back"), py::arg("my_dm_back"),
+             "Override DM influence-function FFT and MFT matrices (complex).")
+        .def("forward", &control_model_forward_wrapper,
+             py::arg("actuators"),
+             py::arg("wavelength") = std::nullopt,
+             py::arg("use_vortex") = true,
+             "Forward optical simulation (returns focal-plane complex field).");
+
+    m.def("control_model_val_and_grad", &control_model_val_and_grad_wrapper,
+          py::arg("del_acts"), py::arg("model"), py::arg("current_acts"),
+          py::arg("e_ab"), py::arg("e_fp_nom"), py::arg("control_mask"),
+          py::arg("wavelength") = std::nullopt, py::arg("r_cond") = 1e-3,
+          "C++ val_and_grad for the EFC objective. Returns (J, grad).");
+    m.def("control_model_dm_val_and_grad", &control_model_dm_val_and_grad_wrapper,
+          py::arg("model"), py::arg("del_acts"), py::arg("opd"),
+          "Native DM-surface fit objective+gradient. Returns (J, grad).");
+    m.def("control_model_solve_flat", &control_model_solve_flat_wrapper,
+          py::arg("model"), py::arg("opd"),
+          py::arg("tol") = 1e-4, py::arg("max_iter") = 0,
+          "Solve the flat-DM actuator vector via native L-BFGS. Returns del_acts.");
+    m.def("control_model_iefc_calibrate", &control_model_iefc_calibrate_wrapper,
+          py::arg("model"),
+          py::arg("control_mask"),
+          py::arg("probe_amplitude"),
+          py::arg("probe_modes"),
+          py::arg("calibration_amplitude"),
+          py::arg("calibration_modes"),
+          py::arg("scale_factors") = py::none(),
+          py::arg("initial_command") = py::none(),
+          py::arg("use_vortex") = true,
+          py::arg("imax_ref") = 1.0,
+          py::arg("progress_cb") = py::none(),
+          "Native iEFC calibration for ControlModel. Returns "
+          "(response_matrix, response_cube).");
 }

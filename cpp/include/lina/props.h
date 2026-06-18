@@ -24,7 +24,7 @@ Array2D<std::complex<double>> make_vortex_phase_mask(std::size_t npix,
 
 Array2D<std::complex<double>> mft_forward(
     const Array2D<std::complex<double>>& wavefront,
-    std::size_t npix,
+    double npix,
     std::size_t npsf,
     double psf_pixelscale_lamD,
     char convention = '-',
@@ -34,7 +34,7 @@ Array2D<std::complex<double>> mft_forward(
 Array2D<std::complex<double>> mft_reverse(
     const Array2D<std::complex<double>>& fpwf,
     double psf_pixelscale_lamD,
-    std::size_t npix,
+    double npix,
     std::size_t N,
     char convention = '+',
     const char* pp_centering = "odd",
@@ -69,7 +69,7 @@ Array2D<std::complex<double>> make_vortex_phase_mask_gpu(std::size_t npix,
 
 Array2D<std::complex<double>> mft_forward_gpu(
     const Array2D<std::complex<double>>& wavefront,
-    std::size_t npix,
+    double npix,
     std::size_t npsf,
     double psf_pixelscale_lamD,
     char convention = '-',
@@ -79,7 +79,7 @@ Array2D<std::complex<double>> mft_forward_gpu(
 Array2D<std::complex<double>> mft_reverse_gpu(
     const Array2D<std::complex<double>>& fpwf,
     double psf_pixelscale_lamD,
-    std::size_t npix,
+    double npix,
     std::size_t N,
     char convention = '+',
     const char* pp_centering = "odd",

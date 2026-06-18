@@ -45,7 +45,7 @@ constexpr double kTwoPi = 2.0 * M_PI;
 // ---------------------------------------------------------------------------
 
 struct MftKey {
-    std::size_t npix;
+    double npix;            // pupil sampling parameter (dx = 1/npix); may be fractional
     std::size_t npsf;
     std::size_t N;          // wavefront side length (for mft_forward) or
                             // pupil side length (for mft_reverse)
@@ -66,7 +66,7 @@ struct MftKey {
 struct MftKeyHash {
     std::size_t operator()(const MftKey& k) const noexcept {
         // Mix the integral fields; double goes through std::hash.
-        std::size_t h = std::hash<std::size_t>{}(k.npix);
+        std::size_t h = std::hash<double>{}(k.npix);
         h ^= std::hash<std::size_t>{}(k.npsf) + 0x9e3779b97f4a7c15ULL
              + (h << 6) + (h >> 2);
         h ^= std::hash<std::size_t>{}(k.N)    + 0x9e3779b97f4a7c15ULL
@@ -447,7 +447,7 @@ Array2D<std::complex<double>> make_vortex_phase_mask(std::size_t npix,
 
 Array2D<std::complex<double>> mft_forward(
     const Array2D<std::complex<double>>& wavefront,
-    std::size_t npix,
+    double npix,
     std::size_t npsf,
     double psf_pixelscale_lamD,
     char convention,
@@ -459,14 +459,14 @@ Array2D<std::complex<double>> mft_forward(
         throw std::invalid_argument("mft_forward expects square wavefront");
     }
 
-    const double dx = 1.0 / static_cast<double>(npix);
+    const double dx = 1.0 / npix;
     const double du = psf_pixelscale_lamD;
 
     const auto Xs = build_coordinates(N, dx, pp_centering);
     const auto Us = build_coordinates(npsf, du, fp_centering);
 
     const double sign = (convention == '-') ? -1.0 : 1.0;
-    const double scale = psf_pixelscale_lamD / static_cast<double>(npix);
+    const double scale = psf_pixelscale_lamD / npix;
 
     // Strategy: precompute the two MFT matrices ONCE per geometry
     // (cached across calls -- see mft_cache_get_or_build), then
@@ -556,7 +556,7 @@ Array2D<std::complex<double>> mft_forward(
 Array2D<std::complex<double>> mft_reverse(
     const Array2D<std::complex<double>>& fpwf,
     double psf_pixelscale_lamD,
-    std::size_t npix,
+    double npix,
     std::size_t N,
     char convention,
     const char* pp_centering,
@@ -568,13 +568,13 @@ Array2D<std::complex<double>> mft_reverse(
     }
 
     const double du = psf_pixelscale_lamD;
-    const double dx = 1.0 / static_cast<double>(npix);
+    const double dx = 1.0 / npix;
 
     const auto Us = build_coordinates(npsf, du, fp_centering);
     const auto Xs = build_coordinates(N, dx, pp_centering);
 
     const double sign = (convention == '+') ? 1.0 : -1.0;
-    const double scale = psf_pixelscale_lamD / static_cast<double>(npix);
+    const double scale = psf_pixelscale_lamD / npix;
 
     // Same precompute-then-BLAS strategy as mft_forward, with caching.
     //   Mx[x, u]  = exp(j * sign * 2π * Xs[x] * Us[u])       (N, npsf)

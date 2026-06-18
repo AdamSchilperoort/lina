@@ -196,6 +196,51 @@ SvdResult svd(const Array2D<double>& a) {
     return {u, s, vt};
 }
 
+SvdResult svd_thin(const Array2D<double>& a) {
+    const std::size_t m = a.rows();
+    const std::size_t n = a.cols();
+    const std::size_t k = std::min(m, n);
+    Array2D<double> u(m, k, 0.0);    // economy U (m x k)
+    Array2D<double> vt(k, n, 0.0);   // economy V^T (k x n)
+    std::vector<double> s(k, 0.0);
+
+#if defined(LINA_USE_LAPACKE)
+    std::vector<double> a_copy(a.data(), a.data() + a.size());
+    const lapack_int m_i = static_cast<lapack_int>(m);
+    const lapack_int n_i = static_cast<lapack_int>(n);
+    const lapack_int lda = static_cast<lapack_int>(n);
+    const lapack_int ldu = static_cast<lapack_int>(k);   // row-major: cols of U
+    const lapack_int ldvt = static_cast<lapack_int>(n);  // row-major: cols of Vt
+
+    // jobz='S' -> economy: U is m x k, Vt is k x n.
+    const lapack_int info = LAPACKE_dgesdd(
+        LAPACK_ROW_MAJOR, 'S', m_i, n_i,
+        a_copy.data(), lda, s.data(), u.data(), ldu, vt.data(), ldvt);
+    if (info != 0) {
+        throw std::runtime_error("LAPACKE_dgesdd (thin) failed");
+    }
+#elif defined(LINA_USE_EIGEN_SVD)
+    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> mat(
+        a.data(), static_cast<int>(m), static_cast<int>(n));
+    Eigen::JacobiSVD<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> svd(
+        mat, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    Eigen::MatrixXd u_e = svd.matrixU();
+    Eigen::MatrixXd v_e = svd.matrixV();
+    Eigen::VectorXd s_e = svd.singularValues();
+    for (std::size_t i = 0; i < s.size(); ++i) s[i] = s_e(static_cast<int>(i));
+    for (std::size_t r = 0; r < m; ++r)
+        for (std::size_t c = 0; c < k; ++c)
+            u(r, c) = u_e(static_cast<int>(r), static_cast<int>(c));
+    for (std::size_t r = 0; r < k; ++r)
+        for (std::size_t c = 0; c < n; ++c)
+            vt(r, c) = v_e(static_cast<int>(c), static_cast<int>(r));
+#else
+    throw std::runtime_error("SVD unavailable: build with LAPACKE or Eigen");
+#endif
+
+    return {u, s, vt};
+}
+
 SvdResultF svd_float_cpu(const Array2D<float>& a) {
     const std::size_t m = a.rows();
     const std::size_t n = a.cols();
