@@ -176,6 +176,24 @@ def test_create_annular_focal_plane_mask():
     assert_close(_np(a).astype(float), _np(b).astype(float), rtol=1e-12, name="annular_fp_mask")
 
 
+@pytest.mark.parametrize("npsf,rotation,shift", [
+    (150, 90, (0, 0)),   # the sim_iefc_demo wfs_mask case (edge cut + 90 deg)
+    (64, 90, (0, 0)),
+    (65, 90, (2, -3)),
+    (150, 0, (0, 0)),
+])
+def test_create_annular_focal_plane_mask_edge_rotate(npsf, rotation, shift):
+    # Exercises the edge half-plane cut + raster rotate/shift path, which must
+    # match lina's rasterize-then-ndimage.rotate/shift(order=0) exactly for the
+    # axis-aligned rotations the pipeline uses.
+    xs, ys = shift
+    kw = dict(edge=3, rotation=rotation, centering="odd", x_shift=xs, y_shift=ys)
+    a = lina.utils.create_annular_focal_plane_mask(npsf, 0.2, 3, 10, **kw)
+    b = lina_cpp.utils.create_annular_focal_plane_mask(npsf, 0.2, 3, 10, **kw)
+    assert_close(_np(a).astype(float), _np(b).astype(float), rtol=1e-12,
+                 name=f"annular_fp_mask(rot={rotation},shift={shift})")
+
+
 def test_lstsq():
     modes = real((6, 32, 32))
     data = real((32, 32))

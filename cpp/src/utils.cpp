@@ -92,6 +92,71 @@ std::pair<Array2D<double>, Array2D<double>> make_grid(std::size_t npix,
     return {x, y};
 }
 
+namespace {
+
+// Nearest-neighbour raster rotate matching scipy.ndimage.rotate(
+//   input, angle_deg, reshape=False, order=0, mode='constant', cval=0).
+// For each output index o, the source index is i = R @ (o - center) + center
+// with R = [[cos, sin], [-sin, cos]] and center = (shape - 1) / 2, sampled with
+// floor(coord + 0.5) (scipy's order-0 spline rounding). This reproduces lina's
+// exact pixels for axis-aligned rotations (e.g. 90 deg) and is within a couple
+// of boundary pixels of scipy for arbitrary angles (inherent nearest-neighbour
+// tie-breaking).
+Array2D<std::uint8_t> ndimage_rotate_nn(const Array2D<std::uint8_t>& in,
+                                        double angle_deg) {
+    const std::size_t n0 = in.rows();
+    const std::size_t n1 = in.cols();
+    const double a = angle_deg * M_PI / 180.0;
+    const double c = std::cos(a);
+    const double s = std::sin(a);
+    const double cen0 = (static_cast<double>(n0) - 1.0) / 2.0;
+    const double cen1 = (static_cast<double>(n1) - 1.0) / 2.0;
+
+    Array2D<std::uint8_t> out(n0, n1, 0);
+    for (std::size_t r = 0; r < n0; ++r) {
+        for (std::size_t col = 0; col < n1; ++col) {
+            const double o0 = static_cast<double>(r) - cen0;
+            const double o1 = static_cast<double>(col) - cen1;
+            const double i0 = c * o0 + s * o1 + cen0;
+            const double i1 = -s * o0 + c * o1 + cen1;
+            const long ir = static_cast<long>(std::floor(i0 + 0.5));
+            const long ic = static_cast<long>(std::floor(i1 + 0.5));
+            if (ir >= 0 && ir < static_cast<long>(n0) &&
+                ic >= 0 && ic < static_cast<long>(n1)) {
+                out(r, col) = in(static_cast<std::size_t>(ir),
+                                 static_cast<std::size_t>(ic));
+            }
+        }
+    }
+    return out;
+}
+
+// Nearest-neighbour raster shift matching scipy.ndimage.shift(
+//   input, (y_shift, x_shift), order=0, mode='constant', cval=0).
+Array2D<std::uint8_t> ndimage_shift_nn(const Array2D<std::uint8_t>& in,
+                                       double y_shift,
+                                       double x_shift) {
+    const std::size_t n0 = in.rows();
+    const std::size_t n1 = in.cols();
+    Array2D<std::uint8_t> out(n0, n1, 0);
+    for (std::size_t r = 0; r < n0; ++r) {
+        for (std::size_t col = 0; col < n1; ++col) {
+            const long ir = static_cast<long>(
+                std::floor(static_cast<double>(r) - y_shift + 0.5));
+            const long ic = static_cast<long>(
+                std::floor(static_cast<double>(col) - x_shift + 0.5));
+            if (ir >= 0 && ir < static_cast<long>(n0) &&
+                ic >= 0 && ic < static_cast<long>(n1)) {
+                out(r, col) = in(static_cast<std::size_t>(ir),
+                                 static_cast<std::size_t>(ic));
+            }
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
 Array2D<std::uint8_t> create_annular_mask(std::size_t n,
                                           double pixelscale,
                                           double irad,
@@ -103,27 +168,27 @@ Array2D<std::uint8_t> create_annular_mask(std::size_t n,
     const double half = static_cast<double>(n) / 2.0;
     Array2D<std::uint8_t> mask(n, n, 0);
 
-    const double radians = rotation_deg * M_PI / 180.0;
-    const double cos_r = std::cos(radians);
-    const double sin_r = std::sin(radians);
-
+    // Build the mask in the unrotated frame, exactly like lina.utils:
+    //   x = (linspace(-N/2, N/2-1, N) + 1/2) * pixelscale; r = hypot(x, y);
+    //   mask = (r > irad) & (r < orad); if edge: mask &= (x > edge)
+    // The edge cut is applied on the UNROTATED x; the rotate/shift below are
+    // raster operations applied to the rasterized mask (see lina.utils).
     for (std::size_t r = 0; r < n; ++r) {
         for (std::size_t c = 0; c < n; ++c) {
             const double x = (static_cast<double>(c) - half + 0.5) * pixelscale;
             const double y = (static_cast<double>(r) - half + 0.5) * pixelscale;
-
-            const double xr = (x - x_shift) * cos_r + (y - y_shift) * sin_r;
-            const double yr = -(x - x_shift) * sin_r + (y - y_shift) * cos_r;
-
-            const double rr = std::hypot(xr, yr);
-            // Always apply edge as a real cut on xr. Pass a very-negative
-            // value (the default) to disable the cut. This matches Python
-            // semantics where `edge=0` means "filter at x>0" and
-            // `edge=None` (here mapped to default) means "no filter".
-            if (rr > irad && rr < orad && xr > edge) {
+            const double rr = std::hypot(x, y);
+            if (rr > irad && rr < orad && x > edge) {
                 mask(r, c) = 1;
             }
         }
+    }
+
+    if (rotation_deg != 0.0) {
+        mask = ndimage_rotate_nn(mask, rotation_deg);
+    }
+    if (x_shift != 0.0 || y_shift != 0.0) {
+        mask = ndimage_shift_nn(mask, y_shift, x_shift);
     }
     return mask;
 }
@@ -141,23 +206,29 @@ Array2D<std::uint8_t> create_annular_focal_plane_mask(std::size_t npsf,
     const double offset = (std::string(centering) == "even") ? 0.5 : 0.0;
 
     Array2D<std::uint8_t> mask(npsf, npsf, 0);
-    const double radians = rotation_deg * M_PI / 180.0;
-    const double cos_r = std::cos(radians);
-    const double sin_r = std::sin(radians);
 
+    // Unrotated frame (matches lina.utils.create_annular_focal_plane_mask):
+    //   odd : x = linspace(-npsf/2, npsf/2-1, npsf) * pixelscale
+    //   even: x = (linspace(...) + 1/2) * pixelscale
+    //   mask = (r > irad) & (r < orad); if edge: mask &= (x > edge)
     for (std::size_t r = 0; r < npsf; ++r) {
         for (std::size_t c = 0; c < npsf; ++c) {
             const double x = (static_cast<double>(c) - half + offset) * psf_pixelscale;
             const double y = (static_cast<double>(r) - half + offset) * psf_pixelscale;
-
-            const double xr = (x - x_shift) * cos_r + (y - y_shift) * sin_r;
-            const double yr = -(x - x_shift) * sin_r + (y - y_shift) * cos_r;
-
-            const double rr = std::hypot(xr, yr);
-            if (rr > irad && rr < orad && xr > edge) {
+            const double rr = std::hypot(x, y);
+            if (rr > irad && rr < orad && x > edge) {
                 mask(r, c) = 1;
             }
         }
+    }
+
+    // lina applies ndimage.rotate(order=0) then ndimage.shift(order=0) to the
+    // rasterized mask -- replicate those raster ops here for exact parity.
+    if (rotation_deg != 0.0) {
+        mask = ndimage_rotate_nn(mask, rotation_deg);
+    }
+    if (x_shift != 0.0 || y_shift != 0.0) {
+        mask = ndimage_shift_nn(mask, y_shift, x_shift);
     }
     return mask;
 }
